@@ -121,7 +121,7 @@ pub(crate) struct OutputWriter {
     name: String,
     schema: SchemaRef,
     node_idx: Option<usize>,
-    stats: Vec<ColStats>,
+    stats: Vec<FileColumnStats>,
     rows: i64,
     groups: Groups,
 }
@@ -174,7 +174,7 @@ impl OutputWriter {
         )?;
         let stats = cols
             .iter()
-            .map(|c| ColStats {
+            .map(|c| FileColumnStats {
                 column_id: c.id,
                 ty: c.ty.clone(),
                 size_bytes: 0,

@@ -60,7 +60,7 @@ struct TableMeta {
     columns: HashMap<String, Column>,
 }
 
-pub(crate) struct ColStats {
+pub(crate) struct FileColumnStats {
     column_id: i64,
     ty: String,
     size_bytes: i64,
@@ -76,7 +76,7 @@ pub(crate) struct FileInfo {
     pub(crate) rows: i64,
     pub(crate) size: i64,
     pub(crate) footer: i64,
-    pub(crate) stats: Vec<ColStats>,
+    pub(crate) stats: Vec<FileColumnStats>,
 }
 
 pub async fn connect(cfg: &Config) -> Result<Client> {
@@ -492,7 +492,7 @@ fn file_info(
             .map(|b| b.column(i).null_count() as i64)
             .sum();
         let (min, max, contains_nan) = column_bounds(batches, i)?;
-        stats.push(ColStats {
+        stats.push(FileColumnStats {
             column_id: c.id,
             ty: c.ty.clone(),
             size_bytes,
@@ -731,7 +731,7 @@ pub(crate) async fn update_table_stats(
     table_id: i64,
     has_row: bool,
     next_row_id: i64,
-    stats: &[ColStats],
+    stats: &[FileColumnStats],
 ) -> Result<()> {
     let totals = tx
         .query_one(
@@ -793,14 +793,14 @@ pub(crate) async fn update_table_stats(
     }
 
     #[derive(Clone)]
-    struct ColumnSummary {
+    struct TableColumnStats {
         contains_null: Option<bool>,
         contains_nan: Option<bool>,
         min: Option<String>,
         max: Option<String>,
     }
 
-    let existing: HashMap<i64, ColumnSummary> = tx
+    let existing: HashMap<i64, TableColumnStats> = tx
         .query(
             "SELECT column_id, contains_null, contains_nan, min_value, max_value
                FROM ducklake.ducklake_table_column_stats WHERE table_id = $1",
@@ -811,7 +811,7 @@ pub(crate) async fn update_table_stats(
         .map(|r| {
             (
                 r.get(0),
-                ColumnSummary {
+                TableColumnStats {
                     contains_null: r.get(1),
                     contains_nan: r.get(2),
                     min: r.get(3),
@@ -835,7 +835,7 @@ pub(crate) async fn update_table_stats(
                 s.min.clone(),
                 s.max.clone(),
             ),
-            Some(ColumnSummary {
+            Some(TableColumnStats {
                 contains_null: cn,
                 contains_nan: cnan,
                 min: lo,
