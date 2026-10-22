@@ -4,13 +4,14 @@ use datafusion::arrow::datatypes::SchemaRef;
 pub fn layout() -> Layout {
     Layout {
         schema: "ciso".into(),
+        table: "rtprices".into(),
         time_column: "utcbegin".into(),
         row_group_col: Some("node".into()),
         sort_cols: vec!["node".into(), "utcbegin".into()],
-        dedup_timestamp: "downloaded_at".into(),
+        unique_by_cols: None,
+        dedup_timestamp: Some("downloaded_at".into()),
         timezone: chrono_tz::America::Los_Angeles,
-        lock_timezone: chrono_tz::America::Los_Angeles,
-        author: "fixture".into(),
+        author: Some("fixture".into()),
         lock_namespace: "rustciso.repack".into(),
         ..Layout::default()
     }
@@ -18,7 +19,14 @@ pub fn layout() -> Layout {
 
 pub fn job_from_value(value: serde_json::Value) -> serde_json::Result<repack::Job> {
     let mut job: repack::Job = serde_json::from_value(value)?;
-    job.layout = layout();
+    let mut layout = layout();
+    if let Some((schema, table)) = job.table.split_once('.') {
+        layout.schema = schema.into();
+        layout.table = table.into();
+    } else {
+        layout.table = job.table.clone();
+    }
+    job.layout = layout;
     Ok(job)
 }
 

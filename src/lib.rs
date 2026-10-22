@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use config::identifier;
-pub use config::{Config, Layout, Storage, TimeType, Window};
+pub use config::{Config, Layout, LayoutBuilder, Storage, TimeType, Window};
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit, TimestampMicrosecondType};
 use datafusion::parquet::arrow::arrow_writer::ArrowWriterOptions;
@@ -230,6 +230,170 @@ fn catalog_table_root(
         join_dir(schema_path, "")
     };
     Ok(join_dir(&schema_dir, table_path))
+}
+
+async fn table_tags(c: &impl GenericClient, table_id: i64) -> Result<HashMap<String, String>> {
+    let rows = c
+        .query(
+            "SELECT tag.key, tag.value
+               FROM ducklake.ducklake_tag tag
+               CROSS JOIN LATERAL (
+                   SELECT max(snapshot_id) AS snapshot_id
+                     FROM ducklake.ducklake_snapshot
+               ) latest
+              WHERE tag.object_id = $1
+                AND tag.key IN (
+                    'dkplus.time_column', 'dkplus.timezone', 'dkplus.row_group_col',
+                    'dkplus.sort_cols', 'dkplus.unique_by_cols', 'dkplus.dedup_timestamp'
+                )
+                AND tag.begin_snapshot <= latest.snapshot_id
+                AND (tag.end_snapshot IS NULL OR tag.end_snapshot > latest.snapshot_id)",
+            &[&table_id],
+        )
+        .await
+        .context("reading active DuckLake table tags")?;
+    let mut tags = HashMap::new();
+    for row in rows {
+        let key: String = row.get(0);
+        let value: String = row.get(1);
+        if tags.insert(key.clone(), value).is_some() {
+            bail!("multiple active DuckLake tags for key {key:?}");
+        }
+    }
+    Ok(tags)
+}
+
+const TAG_TIME_COLUMN: &str = "dkplus.time_column";
+const TAG_TIMEZONE: &str = "dkplus.timezone";
+const TAG_ROW_GROUP_COL: &str = "dkplus.row_group_col";
+const TAG_SORT_COLS: &str = "dkplus.sort_cols";
+const TAG_UNIQUE_BY_COLS: &str = "dkplus.unique_by_cols";
+const TAG_DEDUP_TIMESTAMP: &str = "dkplus.dedup_timestamp";
+
+fn tag_value<T: serde::de::DeserializeOwned>(
+    tags: &HashMap<String, String>,
+    key: &str,
+) -> Result<Option<T>> {
+    tags.get(key)
+        .map(|value| {
+            serde_json::from_str(value).with_context(|| format!("decoding DuckLake tag {key:?}"))
+        })
+        .transpose()
+}
+
+fn overridden_tag<T: serde::de::DeserializeOwned>(
+    explicit: Option<T>,
+    tags: &HashMap<String, String>,
+    key: &str,
+) -> Result<Option<T>> {
+    match explicit {
+        Some(value) => Ok(Some(value)),
+        None => tag_value(tags, key),
+    }
+}
+
+pub(crate) async fn resolve_layout(cfg: &Config, builder: LayoutBuilder) -> Result<Layout> {
+    identifier(&builder.schema)?;
+    identifier(&builder.table)?;
+    let mut client = connect(cfg).await?;
+    let tx = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await?;
+    let meta = table_meta(&tx, &builder.schema, &builder.table).await?;
+    let tags = table_tags(&tx, meta.table_id).await?;
+    tx.commit()
+        .await
+        .context("finishing table policy read transaction")?;
+    resolve_layout_settings(builder, &meta, &tags)
+}
+
+fn resolve_layout_settings(
+    builder: LayoutBuilder,
+    meta: &TableMeta,
+    tags: &HashMap<String, String>,
+) -> Result<Layout> {
+    let time_column = overridden_tag(builder.time_column, tags, TAG_TIME_COLUMN)?
+        .context("missing required table setting \"time_column\"")?;
+    let timezone = match builder.timezone {
+        Some(timezone) => timezone,
+        None => tag_value::<String>(tags, TAG_TIMEZONE)?
+            .map(|zone| {
+                zone.parse::<chrono_tz::Tz>()
+                    .with_context(|| format!("invalid timezone tag {zone:?}"))
+            })
+            .transpose()?
+            .context("missing required table setting \"timezone\"")?,
+    };
+    let sort_cols = overridden_tag(builder.sort_cols, tags, TAG_SORT_COLS)?
+        .context("missing required table setting \"sort_cols\"")?;
+    let row_group_col =
+        overridden_tag(builder.row_group_col, tags, TAG_ROW_GROUP_COL)?.unwrap_or(None);
+    let unique_by_cols =
+        overridden_tag(builder.unique_by_cols, tags, TAG_UNIQUE_BY_COLS)?.unwrap_or(None);
+    let dedup_timestamp =
+        overridden_tag(builder.dedup_timestamp, tags, TAG_DEDUP_TIMESTAMP)?.unwrap_or(None);
+    let time_type = match types::arrow_type(
+        &meta
+            .columns
+            .get(&time_column)
+            .with_context(|| format!("table has no configured time column {time_column:?}"))?
+            .ty,
+    )? {
+        DataType::Date32 => TimeType::Date,
+        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => TimeType::TimestampTz,
+        DataType::Timestamp(TimeUnit::Microsecond, None) => TimeType::Timestamp,
+        _ => {
+            bail!("configured time column {time_column:?} must be a date or microsecond timestamp")
+        }
+    };
+    let layout = Layout {
+        schema: builder.schema,
+        table: builder.table.clone(),
+        time_column,
+        time_type,
+        timezone,
+        row_group_col,
+        sort_cols,
+        unique_by_cols,
+        dedup_timestamp,
+        author: builder.author,
+        lock_namespace: builder.lock_namespace.unwrap_or(builder.table),
+    };
+    layout.validate()?;
+    for name in std::iter::once(layout.time_column.as_str())
+        .chain(layout.row_group_col.as_deref())
+        .chain(layout.sort_cols.iter().map(String::as_str))
+        .chain(
+            layout
+                .unique_by_cols
+                .iter()
+                .flat_map(|cols| cols.iter().map(String::as_str)),
+        )
+        .chain(layout.dedup_timestamp.as_deref())
+    {
+        if !meta.columns.contains_key(name) {
+            bail!("configured column {name:?} is not in table");
+        }
+    }
+    if let Some(timestamp) = &layout.dedup_timestamp
+        && !matches!(
+            types::arrow_type(&meta.columns[timestamp].ty)?,
+            DataType::Timestamp(TimeUnit::Microsecond, _)
+        )
+    {
+        bail!("dedup timestamp column {timestamp:?} must be a microsecond timestamp");
+    }
+    if let Some(unique) = &layout.unique_by_cols {
+        for name in unique {
+            if !meta.columns.contains_key(name) {
+                bail!("configured unique column {name:?} is not in table");
+            }
+        }
+    }
+    Ok(layout)
 }
 
 fn arrow_type_matches(catalog_ty: &str, dt: &DataType) -> bool {
@@ -465,7 +629,12 @@ async fn try_register(
         "INSERT INTO ducklake.ducklake_snapshot_changes
            (snapshot_id, changes_made, author, commit_message, commit_extra_info)
          VALUES ($1, $2, $3, $4, NULL)",
-        &[&snapshot_id, &changes, &layout.author, &message],
+        &[
+            &snapshot_id,
+            &changes,
+            &layout.author_for("writer", start, end),
+            &message,
+        ],
     )
     .await
     .context("inserting snapshot changes")?;
@@ -690,19 +859,17 @@ async fn sql_delete(
 pub async fn replace_window(
     cfg: &Config,
     layout: &Layout,
-    table: &str,
     window: &Window,
     batches: Vec<RecordBatch>,
 ) -> Result<LoadReport> {
     layout.validate()?;
-    identifier(table)?;
     let (start, end) = window.bounds(layout)?;
     let batches: Vec<_> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
     if batches.is_empty() {
         bail!("no rows to load for {start}");
     }
     let mut client = connect(cfg).await?;
-    let meta = table_meta(&client, &layout.schema, table).await?;
+    let meta = table_meta(&client, &layout.schema, &layout.table).await?;
     let cols = resolve_columns(&meta, &batches[0].schema())?;
     let utc_col = meta
         .columns
@@ -728,7 +895,7 @@ pub async fn replace_window(
         .with_context(|| format!("uploading {}{}", meta.root, file.name))?;
     let result = register(
         &mut client,
-        table,
+        &layout.table,
         layout,
         &meta,
         utc_col.id,
@@ -781,6 +948,113 @@ async fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn table_layout_uses_tags_and_explicit_overrides() {
+        let meta = TableMeta {
+            table_id: 9,
+            root: String::new(),
+            columns: HashMap::from([
+                (
+                    "observed".into(),
+                    Column {
+                        id: 1,
+                        ty: "date".into(),
+                    },
+                ),
+                (
+                    "station".into(),
+                    Column {
+                        id: 2,
+                        ty: "int32".into(),
+                    },
+                ),
+                (
+                    "fetched_at".into(),
+                    Column {
+                        id: 3,
+                        ty: "timestamp".into(),
+                    },
+                ),
+            ]),
+        };
+        let tags = HashMap::from([
+            (TAG_TIME_COLUMN.into(), "not-json".into()),
+            (TAG_TIMEZONE.into(), "\"Not/AZone\"".into()),
+            (TAG_ROW_GROUP_COL.into(), "null".into()),
+            (TAG_SORT_COLS.into(), r#"["station","observed"]"#.into()),
+            (
+                TAG_UNIQUE_BY_COLS.into(),
+                r#"["station","observed"]"#.into(),
+            ),
+            (TAG_DEDUP_TIMESTAMP.into(), "\"fetched_at\"".into()),
+        ]);
+        let layout = resolve_layout_settings(
+            Layout::builder("weather", "observations")
+                .with_time_column("observed")
+                .with_timezone(chrono_tz::UTC)
+                .with_row_group_col("station")
+                .with_lock_namespace("weather.repack"),
+            &meta,
+            &tags,
+        )
+        .unwrap();
+
+        assert_eq!(layout.time_type, TimeType::Date);
+        assert_eq!(layout.time_column, "observed");
+        assert_eq!(layout.timezone, chrono_tz::UTC);
+        assert_eq!(layout.row_group_col.as_deref(), Some("station"));
+        assert_eq!(layout.sort_cols, ["station", "observed"]);
+        assert_eq!(
+            layout.unique_by_cols.as_deref(),
+            Some(["station".to_string(), "observed".to_string()].as_slice())
+        );
+        assert_eq!(layout.dedup_timestamp.as_deref(), Some("fetched_at"));
+        assert_eq!(layout.lock_namespace, "weather.repack");
+        assert_eq!(layout.author, None);
+
+        let optional_overrides = resolve_layout_settings(
+            Layout::builder("weather", "observations")
+                .with_time_column("observed")
+                .with_timezone(chrono_tz::UTC)
+                .with_sort_cols(vec!["station".into(), "observed".into()])
+                .without_row_grouping()
+                .without_deduplication(),
+            &meta,
+            &tags,
+        )
+        .unwrap();
+        assert_eq!(optional_overrides.row_group_col, None);
+        assert_eq!(optional_overrides.unique_by_cols, None);
+        assert_eq!(optional_overrides.dedup_timestamp, None);
+        assert_eq!(optional_overrides.lock_namespace, "observations");
+        assert_eq!(
+            optional_overrides.author_for(
+                "repacker",
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap(),
+            ),
+            "repacker_20260101T000000Z_20260201T000000Z"
+        );
+    }
+
+    #[test]
+    fn missing_required_layout_tags_fail() {
+        let meta = TableMeta {
+            table_id: 1,
+            root: String::new(),
+            columns: HashMap::new(),
+        };
+        let error = resolve_layout_settings(
+            Layout::builder("weather", "observations"),
+            &meta,
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("time_column"));
+    }
+
     #[tokio::test]
     #[ignore = "requires MAINTENANCE_TEST_DATABASE_URL pointing to isolated test Postgres"]
     async fn typed_sql_delete_uses_half_open_bounds_and_quoted_identifiers() {
@@ -796,6 +1070,7 @@ mod tests {
         for kind in [TimeType::TimestampTz, TimeType::Timestamp, TimeType::Date] {
             let layout = Layout {
                 schema: "pg_temp".into(),
+                table: "records".into(),
                 time_column: "event time".into(),
                 time_type: kind,
                 ..Layout::default()

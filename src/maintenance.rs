@@ -33,11 +33,10 @@ const CANDIDATES: &str = "
 pub async fn table_candidates(
     client: &impl GenericClient,
     layout: &Layout,
-    table: &str,
     granularity: chrono::Duration,
 ) -> Result<Vec<Candidate>> {
     layout.validate()?;
-    identifier(table)?;
+    identifier(&layout.table)?;
     let seconds = granularity.num_seconds();
     if seconds <= 0 || granularity != chrono::Duration::seconds(seconds) {
         bail!("maintenance granularity must be a positive whole number of seconds");
@@ -81,7 +80,7 @@ pub async fn table_candidates(
                 &sql,
                 &[
                     &layout.schema,
-                    &table,
+                    &layout.table,
                     &seconds,
                     &layout.time_column,
                     &layout.timezone.name(),
@@ -92,7 +91,7 @@ pub async fn table_candidates(
         client
             .execute(
                 &sql,
-                &[&layout.schema, &table, &seconds, &layout.time_column],
+                &[&layout.schema, &layout.table, &seconds, &layout.time_column],
             )
             .await?;
     }
@@ -115,12 +114,11 @@ pub async fn table_candidates(
 pub async fn discover(
     cfg: &Config,
     layout: &Layout,
-    table: &str,
     granularity: chrono::Duration,
 ) -> Result<Vec<Candidate>> {
     let mut client = connect(cfg).await?;
     let tx = client.transaction().await?;
-    let candidates = table_candidates(&tx, layout, table, granularity).await?;
+    let candidates = table_candidates(&tx, layout, granularity).await?;
     tx.commit()
         .await
         .context("dropping maintenance temp table")?;

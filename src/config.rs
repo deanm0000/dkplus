@@ -123,45 +123,140 @@ impl TimeType {
     }
 }
 
-/// Application policy, independent of queue messages and catalog connections.
+/// Resolved policy for one DuckLake table. Create it with [`Layout::builder`].
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub schema: String,
+    pub table: String,
     pub time_column: String,
-    pub time_type: TimeType,
+    pub(crate) time_type: TimeType,
     pub timezone: Tz,
-    /// Fixed per table across all writers, independent of the requested window timezone.
-    pub lock_timezone: Tz,
     pub row_group_col: Option<String>,
     pub sort_cols: Vec<String>,
-    pub dedup_timestamp: String,
-    pub author: String,
-    /// Retain an existing namespace when replacing a deployed repack worker.
+    pub unique_by_cols: Option<Vec<String>>,
+    pub dedup_timestamp: Option<String>,
+    pub author: Option<String>,
     pub lock_namespace: String,
 }
 
+/// Placeholder used by deserialized repack jobs until the caller supplies a
+/// resolved per-table layout. Use [`Layout::builder`] for valid layouts.
 impl Default for Layout {
     fn default() -> Self {
         Self {
             schema: "main".into(),
+            table: String::new(),
             time_column: "time".into(),
             time_type: TimeType::TimestampTz,
             timezone: chrono_tz::UTC,
-            lock_timezone: chrono_tz::UTC,
             row_group_col: None,
             sort_cols: vec!["time".into()],
-            dedup_timestamp: "updated_at".into(),
-            author: "dkplus".into(),
-            lock_namespace: "dkplus.repack".into(),
+            unique_by_cols: None,
+            dedup_timestamp: None,
+            author: None,
+            lock_namespace: String::new(),
         }
+    }
+}
+
+/// Builder for resolving table policy from explicit values and DuckLake tags.
+#[derive(Debug, Clone)]
+pub struct LayoutBuilder {
+    pub(crate) schema: String,
+    pub(crate) table: String,
+    pub(crate) time_column: Option<String>,
+    pub(crate) timezone: Option<Tz>,
+    pub(crate) row_group_col: Option<Option<String>>,
+    pub(crate) sort_cols: Option<Vec<String>>,
+    pub(crate) unique_by_cols: Option<Option<Vec<String>>>,
+    pub(crate) dedup_timestamp: Option<Option<String>>,
+    pub(crate) author: Option<String>,
+    pub(crate) lock_namespace: Option<String>,
+}
+
+impl Layout {
+    pub fn builder(schema: impl Into<String>, table: impl Into<String>) -> LayoutBuilder {
+        LayoutBuilder::new(schema, table)
+    }
+}
+
+impl LayoutBuilder {
+    pub fn new(schema: impl Into<String>, table: impl Into<String>) -> Self {
+        Self {
+            schema: schema.into(),
+            table: table.into(),
+            time_column: None,
+            timezone: None,
+            row_group_col: None,
+            sort_cols: None,
+            unique_by_cols: None,
+            dedup_timestamp: None,
+            author: None,
+            lock_namespace: None,
+        }
+    }
+
+    pub fn with_time_column(mut self, name: impl Into<String>) -> Self {
+        self.time_column = Some(name.into());
+        self
+    }
+
+    pub fn with_timezone(mut self, timezone: Tz) -> Self {
+        self.timezone = Some(timezone);
+        self
+    }
+
+    pub fn with_row_group_col(mut self, name: impl Into<String>) -> Self {
+        self.row_group_col = Some(Some(name.into()));
+        self
+    }
+
+    pub fn without_row_grouping(mut self) -> Self {
+        self.row_group_col = Some(None);
+        self
+    }
+
+    pub fn with_sort_cols(mut self, names: Vec<String>) -> Self {
+        self.sort_cols = Some(names);
+        self
+    }
+
+    pub fn with_unique_by_cols(mut self, names: Vec<String>) -> Self {
+        self.unique_by_cols = Some(Some(names));
+        self
+    }
+
+    pub fn without_deduplication(mut self) -> Self {
+        self.unique_by_cols = Some(None);
+        self.dedup_timestamp = Some(None);
+        self
+    }
+
+    pub fn with_dedup_timestamp(mut self, name: impl Into<String>) -> Self {
+        self.dedup_timestamp = Some(Some(name.into()));
+        self
+    }
+
+    pub fn with_author(mut self, author: impl Into<String>) -> Self {
+        self.author = Some(author.into());
+        self
+    }
+
+    pub fn with_lock_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.lock_namespace = Some(namespace.into());
+        self
+    }
+
+    pub async fn resolve(self, cfg: &Config) -> Result<Layout> {
+        crate::resolve_layout(cfg, self).await
     }
 }
 
 impl Layout {
     pub fn validate(&self) -> Result<()> {
         identifier(&self.schema)?;
+        identifier(&self.table)?;
         identifier(&self.time_column)?;
-        identifier(&self.dedup_timestamp)?;
         if self.sort_cols.is_empty() {
             bail!("sort columns must not be empty");
         }
@@ -174,7 +269,40 @@ impl Layout {
                 bail!("row-group column must be the first sort column");
             }
         }
+        if let Some(unique) = &self.unique_by_cols {
+            if unique.is_empty() {
+                bail!("unique columns must not be empty");
+            }
+            let mut seen = std::collections::HashSet::new();
+            for name in unique {
+                identifier(name)?;
+                if !seen.insert(name) {
+                    bail!("unique columns must be distinct");
+                }
+            }
+            if self.dedup_timestamp.is_none() {
+                bail!("deduplication requires a dedup timestamp column");
+            }
+        }
+        if let Some(name) = &self.dedup_timestamp {
+            identifier(name)?;
+        }
         Ok(())
+    }
+
+    pub(crate) fn author_for(
+        &self,
+        operation: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> String {
+        self.author.clone().unwrap_or_else(|| {
+            format!(
+                "{operation}_{}_{}",
+                start.format("%Y%m%dT%H%M%SZ"),
+                end.format("%Y%m%dT%H%M%SZ")
+            )
+        })
     }
 
     pub(crate) fn midnight(&self, date: NaiveDate) -> Result<DateTime<Utc>> {
@@ -255,6 +383,7 @@ mod tests {
         let start = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
         let end = start.succ_opt().unwrap();
         let mut layout = Layout {
+            table: "records".into(),
             timezone: chrono_tz::America::Los_Angeles,
             ..Layout::default()
         };

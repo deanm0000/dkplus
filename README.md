@@ -66,11 +66,12 @@ and footer size.
 
 ## Catalog configuration and operations
 
-Callers own credential/environment parsing and table policy:
+Callers own credential/environment parsing. Table policy can live in DuckLake
+tags and be overridden per operation:
 
 ```rust,no_run
 use std::sync::Arc;
-use dkplus::{Config, Layout, Storage, TimeType, Window};
+use dkplus::{Config, Layout, Storage, Window};
 use dkplus::config::{DEFAULT_REPACK_NODE_BYTES, DEFAULT_REPACK_RUN_BYTES};
 use object_store::memory::InMemory;
 
@@ -84,21 +85,23 @@ async fn main() -> anyhow::Result<()> {
         repack_run_bytes: DEFAULT_REPACK_RUN_BYTES,
         repack_node_bytes: DEFAULT_REPACK_NODE_BYTES,
     };
-    let layout = Layout {
-        schema: "weather".into(), time_column: "observed".into(),
-        time_type: TimeType::Date, row_group_col: Some("station".into()),
-        sort_cols: vec!["station".into(), "observed".into()],
-        dedup_timestamp: "fetched".into(), author: "weather-scraper".into(),
-        ..Layout::default()
-    };
+    let layout = Layout::builder("weather", "observations")
+        .with_time_column("observed")
+        .with_timezone(chrono_tz::America::New_York)
+        .with_row_group_col("station")
+        .with_sort_cols(vec!["station".into(), "observed".into()])
+        .with_unique_by_cols(vec!["station".into(), "observed".into()])
+        .with_dedup_timestamp("fetched")
+        .resolve(&cfg)
+        .await?;
     let begin = "2026-01-01".parse()?;
     let end = "2026-02-01".parse()?;
     let window = Window::Date { start: begin, end };
     // With nonempty Arrow batches matching the existing catalog table:
-    // dkplus::replace_window(&cfg, &layout, "observations", &window, batches).await?;
+    // dkplus::replace_window(&cfg, &layout, &window, batches).await?;
     let job = dkplus::repack::Job {
         layout, table: "weather.observations".into(), begin_date: begin, end_date: end,
-        unique: Some(vec!["station".into(), "observed".into()]), files: None,
+        unique: None, files: None,
         expire_snapshot: dkplus::repack::ExpireSnapshot::Never,
     };
     dkplus::repack::run(&cfg, &job, &mut Vec::new()).await?;
@@ -111,7 +114,7 @@ Tables must already exist; dkplus neither creates tables nor migrates schemas.
 file retirement or pg_ducklake SQL DELETE for straddling/inlined data.
 `Window::TimestampTz`, `Window::Timestamp`, and `Window::Date` carry UTC instants,
 naive microsecond timestamps, and dates respectively. The window kind must match
-the configured column. Bounds are half-open.
+the inferred catalog type of `time_column`. Bounds are half-open.
 
 Repack accepts calendar dates and resolves aware-timestamp midnights in
 `Layout::timezone`; ambiguous/nonexistent midnights fail. Naive/date windows use
@@ -133,11 +136,11 @@ at publication fail explicitly. Snapshot allocation conflicts retry. Repack reta
 candidate outputs on uncertain commit errors; do not delete them without checking
 every retained snapshot. Temporary prefixes may remain after process termination.
 
-All workers for a table must share `lock_namespace` and `lock_timezone`, even if
-their request timezones differ. Locks cover the actual half-open range projected
-into that fixed lock timezone (date/naive domains use calendar dates). Existing
-applications can retain their old namespace/timezone for deployed-worker
-compatibility. Locks survive transactions and are released with the connection.
+Repack uses UTC as the fixed lock timezone. All workers must use the same
+`lock_namespace`; it defaults to the table name and can be overridden when
+replacing a deployed worker. Locks cover the half-open range projected into UTC
+(date/naive domains use calendar dates). Locks survive transactions and are
+released with the connection.
 
 ## Using dkplus as a library
 
@@ -148,29 +151,24 @@ compact with `maintenance::discover` and `repack::run`.
 ### 1. Configure
 
 ```rust,no_run
-use dkplus::{Config, Layout, Storage, TimeType};
+use dkplus::{Config, Layout, Storage};
 use dkplus::config::{DEFAULT_REPACK_NODE_BYTES, DEFAULT_REPACK_RUN_BYTES};
 
-fn build() -> anyhow::Result<(Config, Layout)> {
+async fn build() -> anyhow::Result<(Config, Layout)> {
     let cfg = Config {
         postgres: "host=localhost user=ducklake dbname=catalog".parse()?,
         storage: Storage::local(std::path::Path::new("/data/lake"))?,
         repack_run_bytes: DEFAULT_REPACK_RUN_BYTES,   // external-sort run size
         repack_node_bytes: DEFAULT_REPACK_NODE_BYTES, // merge-node memory budget
     };
-    let layout = Layout {
-        schema: "weather".into(),
-        time_column: "observed".into(),
-        time_type: TimeType::TimestampTz,
-        timezone: chrono_tz::America::New_York,
-        lock_timezone: chrono_tz::UTC,
-        row_group_col: Some("station".into()),
-        sort_cols: vec!["station".into(), "observed".into()],
-        dedup_timestamp: "fetched_at".into(),
-        author: "weather-scraper".into(),
-        lock_namespace: "weather.repack".into(),
-    };
-    layout.validate()?;
+    let layout = Layout::builder("weather", "observations")
+        .with_time_column("observed")
+        .with_timezone(chrono_tz::America::New_York)
+        .with_row_group_col("station")
+        .with_sort_cols(vec!["station".into(), "observed".into()])
+        .with_dedup_timestamp("fetched_at")
+        .resolve(&cfg)
+        .await?;
     Ok((cfg, layout))
 }
 ```
@@ -184,19 +182,31 @@ fn build() -> anyhow::Result<(Config, Layout)> {
 | `repack_run_bytes` | Size of in-memory sorted runs when repack falls back to external sorting (default 128 MiB). |
 | `repack_node_bytes` | Memory budget per merge node (default 256 MiB). |
 
-`Layout` options (all identifiers are validated; `Layout::default()` gives a
-UTC `timestamptz` layout on schema `main`, column `time`):
+`Layout::builder(schema, table)` resolves a table's policy from explicit builder
+values and active DuckLake table tags. Explicit values override tags. Required
+settings left unresolved by both sources fail with an error.
+Resolve a builder when starting an operation to pick up the latest committed
+tags. `with_*` values are per-layout overrides and do not write tags back to
+DuckLake; use DuckLake's tag-management support to persist changes.
 
-| Field | Meaning |
+| Setting | Meaning |
 |---|---|
-| `schema` | Catalog schema; used for bare table names. |
-| `time_column`, `time_type` | Window column and its type: `TimeType::TimestampTz`, `Timestamp` or `Date`. |
-| `timezone` | Zone used to resolve repack date midnights (timestamptz only). |
-| `lock_timezone`, `lock_namespace` | Must be identical across all workers of a table (see locking above). |
-| `row_group_col` | Optional grouping column; must be the first of `sort_cols`. |
-| `sort_cols` | Ascending sort order of repacked files. |
-| `dedup_timestamp` | Microsecond timestamp column used when deduplicating. |
-| `author` | Recorded as the snapshot author. |
+| `time_column` | Required window column; its `date`, `timestamp`, or `timestamptz` type is inferred from the catalog. |
+| `timezone` | Required zone for resolving repack date boundaries on `timestamptz` tables. It is not inferable from `timestamptz`, which stores instants, not a named zone. |
+| `row_group_col` | Optional grouping column; must lead `sort_cols`. Missing/`null` means no row grouping. |
+| `sort_cols` | Required ascending sort order of repacked files. |
+| `unique_by_cols` | Optional columns defining duplicates; missing/`null` disables deduplication. |
+| `dedup_timestamp` | Optional microsecond timestamp used to choose the retained duplicate. Required when `unique_by_cols` is set. |
+| `lock_namespace` | Optional explicit lock namespace; defaults to the table name. |
+| `author` | Optional snapshot author override; defaults to an operation/window-derived value. |
+
+The recognized settings are table-level entries in DuckLake's `ducklake_tag` table,
+namespaced as `dkplus.time_column`, `dkplus.timezone`, `dkplus.row_group_col`,
+`dkplus.sort_cols`, `dkplus.unique_by_cols`, and `dkplus.dedup_timestamp`.
+String settings are JSON strings and list settings are JSON arrays; nullable
+optional settings can be JSON `null`. `ducklake_tag` values are snapshot-versioned;
+the builder reads values active in the catalog's latest snapshot. Manage tags
+through DuckLake's tag facilities rather than editing catalog tables directly.
 
 ### 2. Write to DuckLake
 
@@ -231,7 +241,7 @@ async fn load(cfg: &Config, layout: &Layout) -> anyhow::Result<()> {
         start: t0,
         end: t0 + chrono::Duration::days(1),
     };
-    let report = dkplus::replace_window(cfg, layout, "observations", &window, vec![batch]).await?;
+    let report = dkplus::replace_window(cfg, layout, &window, vec![batch]).await?;
     println!(
         "snapshot {} wrote {} rows to {}; retired {} files ({} rows), sql-deleted {:?}",
         report.snapshot_id, report.rows, report.path,
@@ -246,7 +256,8 @@ async fn load(cfg: &Config, layout: &Layout) -> anyhow::Result<()> {
 window, retired via `end_snapshot`) and `sql_deleted` (rows removed by
 pg_ducklake `DELETE` when a file straddles the window). Commit conflicts are
 retried automatically. Use `Window::Date` for `date` columns and
-`Window::Timestamp` for naive timestamps; the variant must match `Layout::time_type`.
+`Window::Timestamp` for naive timestamps; the variant must match the type inferred
+from the resolved table's time column.
 
 ### 3. Maintenance: discover and repack
 
@@ -260,7 +271,7 @@ use dkplus::{Config, Layout, maintenance, repack};
 async fn compact(cfg: &Config, layout: &Layout) -> anyhow::Result<()> {
     // One-hour granularity: files are expected to span whole hours.
     let candidates =
-        maintenance::discover(cfg, layout, "observations", chrono::Duration::hours(1)).await?;
+        maintenance::discover(cfg, layout, chrono::Duration::hours(1)).await?;
 
     for c in candidates {
         let job = repack::Job {
@@ -269,7 +280,7 @@ async fn compact(cfg: &Config, layout: &Layout) -> anyhow::Result<()> {
             begin_date: c.begin.date(),
             // `end` is an inclusive maximum; repack's end date is exclusive.
             end_date: c.end.date().succ_opt().unwrap(),
-            unique: Some(vec!["station".into(), "observed".into()]), // None: no dedup
+            unique: None, // use unique_by_cols from table tags, if configured
             files: Some(c.files),                                    // freshness guard
             expire_snapshot: repack::ExpireSnapshot::IfNoDedup,
         };
@@ -288,12 +299,12 @@ async fn compact(cfg: &Config, layout: &Layout) -> anyhow::Result<()> {
 
 | Field | Meaning |
 |---|---|
-| `table` | `table` or `schema.table` (letters, digits, underscores). |
+| `table` | `table` or `schema.table` (letters, digits, underscores); it must match the resolved `Layout`. |
 | `begin_date`, `end_date` | Calendar dates, `end_date` exclusive. |
-| `unique` | Key columns for deduplication; `None` disables it. Requires `Layout::dedup_timestamp`. |
+| `unique` | Optional explicit key-column override; if omitted, uses `unique_by_cols` resolved from the `Layout`. Configure `Layout::builder(...).without_deduplication()` to explicitly disable table-tag deduplication. |
 | `files` | Optional freshness guard of catalog paths; skip if none are current. |
 | `expire_snapshot` | `Never` (default), `IfNoDedup`, or `Always`; see snapshot expiry below. |
-| `layout` | Not serialized. Set it yourself after deserializing a queued job. |
+| `layout` | Resolved per-table policy; not serialized. Set it yourself after deserializing a queued job. |
 
 For custom transactions use `maintenance::table_candidates(&client, ...)`.
 Candidates are only a heuristic; they enqueue nothing.
@@ -323,7 +334,8 @@ then:
 
 - inserts one new snapshot (id = previous + 1) with change
   `compacted_table:<id>` (plus `deleted_from_table:<id>` if deduplication removed
-  rows), `Layout::author` and a commit message `repack <table> [begin, end) <tz>`;
+  rows),   the configured author override (or a generated operation/window author) and
+  a commit message `repack <table> [begin, end) <tz>`;
 - sets `end_snapshot` on the source data files and their delete files (they are
   *retired*, not deleted, so older snapshots still read them);
 - inserts the new data files and their per-column stats, and updates
@@ -337,7 +349,7 @@ Commit conflicts retry up to 6 times; a changed source set or schema fails with 
 | Policy | Behavior |
 |---|---|
 | `ExpireSnapshot::Never` | Default: retain the previous snapshot. |
-| `ExpireSnapshot::IfNoDedup` | Expire only if `unique` is `None` (deduplication is disabled). |
+| `ExpireSnapshot::IfNoDedup` | Expire only if deduplication is disabled in both the job override and resolved table policy. |
 | `ExpireSnapshot::Always` | Expire even when deduplication changes logical data. |
 
 Serialized jobs use `"expire_snapshot": "never"`, `"if_no_dedup"` or `"always"`;
@@ -386,12 +398,16 @@ A *node* is one distinct value of `Layout::row_group_col` (for example a station
 or device ID). You pick it once, in the `Layout`, and it must also be the first of
 `sort_cols`:
 
-```rust
-let layout = dkplus::Layout {
-    row_group_col: Some("station".into()),
-    sort_cols: vec!["station".into(), "observed".into()],
-    ..dkplus::Layout::default()
-};
+```rust,no_run
+async fn configure(cfg: &dkplus::Config) -> anyhow::Result<()> {
+    let _layout = dkplus::Layout::builder("weather", "observations")
+        .with_timezone(chrono_tz::UTC)
+        .with_row_group_col("station")
+        .with_sort_cols(vec!["station".into(), "observed".into()])
+        .resolve(cfg)
+        .await?;
+    Ok(())
+}
 ```
 
 Because files are sorted by the node first, each node's rows are contiguous and a
@@ -426,8 +442,8 @@ less I/O. Progress is logged to stderr and the `log` vector.
 
 `boolean`, `int8/16/32/64`, `uint8/16/32/64`, `float32/64`, `varchar`, `date`
 (Date32), `timestamp`/`timestamp_us` and `timestamptz` (microseconds). The time
-column must be `timestamptz`, `timestamp` or `date` to match `Layout::time_type`,
-and the dedup timestamp must be a microsecond timestamp.
+column must be `timestamptz`, `timestamp` or `date`; dkplus infers that type from
+the catalog. The dedup timestamp must be a microsecond timestamp.
 
 ### Catalog assumptions
 
@@ -436,7 +452,7 @@ and the dedup timestamp must be a microsecond timestamp.
 - Window column statistics are present in `ducklake_file_column_stats`; for
   `date` columns max values are treated as inclusive whole days.
 - Concurrent repacks of overlapping ranges serialise on Postgres advisory locks
-  keyed by `lock_namespace`, table and calendar day in `lock_timezone`.
+  keyed by `lock_namespace`, table and UTC calendar day.
 
 ### Cleaning up expired files
 
@@ -548,7 +564,7 @@ flushed before repacking.
 
 ## Maintenance
 
-`maintenance::discover(&cfg, &layout, table, granularity)` returns candidates
+`maintenance::discover(&cfg, &layout, granularity)` returns candidates
 without enqueueing anything. `table_candidates` can use a caller-owned transaction.
 Each table discovery materializes stats in a separate statement before timestamp
 casts, preserving temporary-table cleanup and avoiding casts of unrelated stats.

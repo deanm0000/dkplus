@@ -272,14 +272,18 @@ impl Runs {
     #[cfg(test)]
     pub(super) fn for_unique(unique: &[String]) -> Self {
         let mut runs = Self::new();
-        runs.set_unique(unique);
+        let timestamp = runs
+            .report
+            .dedup_timestamp
+            .clone()
+            .expect("test layout has a dedup timestamp");
+        runs.set_unique(unique, &timestamp);
         runs
     }
 
-    pub(super) fn set_unique(&mut self, unique: &[String]) {
+    pub(super) fn set_unique(&mut self, unique: &[String], timestamp: &str) {
         self.ordering = unique.iter().map(|name| (name.clone(), false)).collect();
-        self.ordering
-            .push((self.report.dedup_timestamp.clone(), true));
+        self.ordering.push((timestamp.into(), true));
         self.ordering.push((ROW_ID.into(), true));
     }
 

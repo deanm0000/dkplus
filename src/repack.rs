@@ -70,8 +70,8 @@ impl ExpireSnapshot {
         *self == Self::Never
     }
 
-    fn enabled(self, unique: &Option<Vec<String>>) -> bool {
-        self == Self::Always || (self == Self::IfNoDedup && unique.is_none())
+    fn enabled(self, deduplication_enabled: bool) -> bool {
+        self == Self::Always || (self == Self::IfNoDedup && !deduplication_enabled)
     }
 }
 
@@ -120,6 +120,18 @@ impl Job {
                 "table must be a table name or schema.table using letters, digits and underscores"
             );
         }
+        let (schema, table) = self.names();
+        if schema != self.layout.schema || table != self.layout.table {
+            bail!(
+                "job table {} does not match resolved layout {}.{}",
+                self.table,
+                self.layout.schema,
+                self.layout.table
+            );
+        }
+        if self.effective_unique().is_some() && self.layout.dedup_timestamp.is_none() {
+            bail!("deduplication requires a dedup timestamp column");
+        }
         if self.begin_date >= self.end_date {
             bail!("begin_date must precede end_date (exclusive)");
         }
@@ -132,7 +144,7 @@ impl Job {
     }
 
     fn validate_schema(&self, schema: &SchemaRef) -> Result<()> {
-        if let Some(unique) = &self.unique {
+        if let Some(unique) = self.effective_unique() {
             for name in unique {
                 schema
                     .index_of(name)
@@ -140,7 +152,12 @@ impl Job {
             }
             if !matches!(
                 schema
-                    .field_with_name(&self.layout.dedup_timestamp)?
+                    .field_with_name(
+                        self.layout
+                            .dedup_timestamp
+                            .as_deref()
+                            .context("deduplication requires a dedup timestamp column")?,
+                    )?
                     .data_type(),
                 DataType::Timestamp(TimeUnit::Microsecond, _)
             ) {
@@ -151,6 +168,10 @@ impl Job {
             }
         }
         Ok(())
+    }
+
+    fn effective_unique(&self) -> Option<&Vec<String>> {
+        self.unique.as_ref().or(self.layout.unique_by_cols.as_ref())
     }
 
     fn names(&self) -> (&str, &str) {
@@ -825,7 +846,7 @@ async fn try_aligned(
         );
         return Ok(None);
     };
-    if let Some(unique) = &job.unique
+    if let Some(unique) = job.effective_unique()
         && !unique.iter().any(|name| name == row_group_col)
     {
         fast_progress(
@@ -1103,9 +1124,15 @@ async fn align_cursors(
         }
         live_rows += node.num_rows() as i64;
         let mut regions = split(&node, job)?;
-        if let Some(unique) = &job.unique {
-            let (deduplicated, count) =
-                sort::deduplicate_batch(&regions[1], unique, &job.layout.dedup_timestamp)?;
+        if let Some(unique) = job.effective_unique() {
+            let (deduplicated, count) = sort::deduplicate_batch(
+                &regions[1],
+                unique,
+                job.layout
+                    .dedup_timestamp
+                    .as_deref()
+                    .context("deduplication requires a dedup timestamp column")?,
+            )?;
             removed += count;
             regions[1] = deduplicated;
         }
@@ -1258,8 +1285,14 @@ async fn prepare(
         work.discard_outputs().await?;
     }
     let mut runs: [_; 3] = std::array::from_fn(|_| sort::Runs::for_report(job.report().clone()));
-    if let Some(unique) = &job.unique {
-        runs[1].set_unique(unique);
+    if let Some(unique) = job.effective_unique() {
+        runs[1].set_unique(
+            unique,
+            job.layout
+                .dedup_timestamp
+                .as_deref()
+                .context("deduplication requires a dedup timestamp column")?,
+        );
     }
     let mut live_rows = 0i64;
     for (index, source) in sources.iter().enumerate() {
@@ -1321,7 +1354,7 @@ async fn prepare(
             format!("merging {} region", ["before", "in-range", "after"][i]),
         );
         let run = if i == 1
-            && let Some(unique) = &job.unique
+            && let Some(unique) = job.effective_unique()
         {
             let (run, count) = run.deduplicate(work, unique).await?;
             removed = count;
@@ -1367,12 +1400,8 @@ async fn lock_range(client: &Client, job: &Job) -> Result<()> {
         .context("lock range underflow")?;
     let (mut date, last) = if job.layout.time_type == TimeType::TimestampTz {
         (
-            job.start()?
-                .with_timezone(&job.layout.lock_timezone)
-                .date_naive(),
-            last_instant
-                .with_timezone(&job.layout.lock_timezone)
-                .date_naive(),
+            job.start()?.with_timezone(&chrono_tz::UTC).date_naive(),
+            last_instant.with_timezone(&chrono_tz::UTC).date_naive(),
         )
     } else {
         (job.begin_date, last_instant.date_naive())
@@ -1428,7 +1457,9 @@ async fn commit(
         .isolation_level(IsolationLevel::RepeatableRead)
         .start()
         .await?;
-    let expire = job.expire_snapshot.enabled(&job.unique);
+    let expire = job
+        .expire_snapshot
+        .enabled(job.effective_unique().is_some());
     if expire {
         expire::lock(&tx).await?;
     }
@@ -1456,7 +1487,7 @@ async fn commit(
         .map(|s| s.rows - s.delete.as_ref().map_or(0, |d| d.count))
         .sum::<i64>()
         - files.iter().map(|f| f.rows).sum::<i64>();
-    if removed < 0 || (job.unique.is_none() && removed != 0) {
+    if removed < 0 || (job.effective_unique().is_none() && removed != 0) {
         bail!("invalid repack logical row count change: {removed}");
     }
     let snapshot_id = prev + 1;
@@ -1483,7 +1514,7 @@ async fn commit(
             } else {
                 format!("compacted_table:{}", meta.table_id)
             },
-            &job.layout.author,
+            &job.layout.author_for("repacker", job.start()?, job.end()?),
             &format!(
                 "repack {} [{}, {}) {}",
                 job.table, job.begin_date, job.end_date, job.layout.timezone
@@ -1682,7 +1713,10 @@ pub async fn run(cfg: &Config, job: &Job, log: &mut Vec<String>) -> Result<()> {
         };
         progress(log, format!("committed compaction snapshot {snapshot}; retired {} files in {:.1}s",
             selected.len(), started.elapsed().as_secs_f64()));
-        if job.expire_snapshot.enabled(&job.unique) {
+        if job
+            .expire_snapshot
+            .enabled(job.effective_unique().is_some())
+        {
             progress(log, format!("expired predecessor snapshot {} atomically with snapshot {snapshot}; \
                 replaced files needed by retained snapshots were preserved", snapshot - 1));
         }
@@ -2766,8 +2800,8 @@ mod tests {
             payload["expire_snapshot"] = serde_json::json!(encoded);
             let job: Job = crate::test_support::job_from_value(payload).unwrap();
             assert_eq!(job.expire_snapshot, policy);
-            assert_eq!(policy.enabled(&None), no_dedup);
-            assert_eq!(policy.enabled(&Some(vec!["node".into()])), dedup);
+            assert_eq!(policy.enabled(false), no_dedup);
+            assert_eq!(policy.enabled(true), dedup);
             let encoded_job = serde_json::to_value(&job).unwrap();
             let decoded: Job = crate::test_support::job_from_value(encoded_job).unwrap();
             assert_eq!(decoded.expire_snapshot, policy);
@@ -2834,7 +2868,6 @@ mod tests {
         first.begin_date = "2026-01-01".parse().unwrap();
         first.end_date = "2026-01-02".parse().unwrap();
         first.layout.timezone = chrono_tz::UTC;
-        first.layout.lock_timezone = chrono_tz::UTC;
         let mut second = first.clone();
         second.begin_date = "2026-01-02".parse().unwrap();
         second.end_date = "2026-01-03".parse().unwrap();

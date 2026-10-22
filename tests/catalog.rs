@@ -12,6 +12,8 @@ CREATE TABLE ducklake.ducklake_schema (
 CREATE TABLE ducklake.ducklake_table (
     table_id bigint, schema_id bigint, table_name text, path text, path_is_relative bool, end_snapshot bigint);
 CREATE TABLE ducklake.ducklake_metadata (key text, value text, scope text);
+CREATE TABLE ducklake.ducklake_tag (
+    object_id bigint, begin_snapshot bigint, end_snapshot bigint, key text, value text);
 CREATE TABLE ducklake.ducklake_partition_info (table_id bigint, end_snapshot bigint);
 CREATE TABLE ducklake.ducklake_column (
     table_id bigint, column_id bigint, column_name text, column_type text, parent_column bigint, end_snapshot bigint);
@@ -62,6 +64,22 @@ async fn expiry_fixture(
         )
         .await
         .unwrap();
+    for (key, value, end_snapshot) in [
+        ("dkplus.time_column", r#""stale""#, Some(0_i64)),
+        ("dkplus.time_column", r#""observed""#, None),
+        ("dkplus.timezone", r#""UTC""#, None),
+        ("dkplus.row_group_col", r#""station""#, None),
+        ("dkplus.sort_cols", r#"["station","observed"]"#, None),
+        ("dkplus.dedup_timestamp", r#""fetched""#, None),
+    ] {
+        client
+            .execute(
+                "INSERT INTO ducklake.ducklake_tag VALUES (1,0,$1,$2,$3)",
+                &[&end_snapshot, &key, &value],
+            )
+            .await
+            .unwrap();
+    }
     let cfg = Config {
         postgres: postgres.clone(),
         storage: Storage::Store {
@@ -71,15 +89,11 @@ async fn expiry_fixture(
         repack_run_bytes: 1,
         repack_node_bytes: 16 * 1024 * 1024,
     };
-    let layout = Layout {
-        schema: "weather".into(),
-        time_column: "observed".into(),
-        time_type: TimeType::Date,
-        row_group_col: Some("station".into()),
-        sort_cols: vec!["station".into(), "observed".into()],
-        dedup_timestamp: "fetched".into(),
-        ..Layout::default()
-    };
+    let layout = Layout::builder("weather", "observations")
+        .with_author("weather-loader")
+        .resolve(&cfg)
+        .await
+        .unwrap();
     let start: NaiveDate = "2026-01-01".parse().unwrap();
     let end: NaiveDate = "2026-02-01".parse().unwrap();
     let day = start
@@ -100,15 +114,9 @@ async fn expiry_fixture(
         ),
     ])
     .unwrap();
-    let loaded = dkplus::replace_window(
-        &cfg,
-        &layout,
-        "observations",
-        &Window::Date { start, end },
-        vec![batch],
-    )
-    .await
-    .unwrap();
+    let loaded = dkplus::replace_window(&cfg, &layout, &Window::Date { start, end }, vec![batch])
+        .await
+        .unwrap();
     let job = dkplus::repack::Job {
         layout,
         table: "weather.observations".into(),
@@ -624,17 +632,6 @@ async fn exercise_catalog(storage: Storage) {
             )
             .await
             .unwrap();
-        let layout = Layout {
-            schema: "weather".into(),
-            time_column: "observed".into(),
-            time_type: kind,
-            timezone: chrono_tz::Asia::Tokyo,
-            row_group_col: Some("station".into()),
-            sort_cols: vec!["station".into(), "observed".into()],
-            dedup_timestamp: "fetched".into(),
-            author: "weather-loader".into(),
-            ..Layout::default()
-        };
         let columns = [
             ("observed", ty),
             ("station", "uint64"),
@@ -661,6 +658,16 @@ async fn exercise_catalog(storage: Storage) {
                 .await
                 .unwrap();
         }
+        let layout = Layout::builder("weather", &table)
+            .with_time_column("observed")
+            .with_timezone(chrono_tz::Asia::Tokyo)
+            .with_row_group_col("station")
+            .with_sort_cols(vec!["station".into(), "observed".into()])
+            .with_dedup_timestamp("fetched")
+            .with_author("weather-loader")
+            .resolve(&cfg)
+            .await
+            .unwrap();
         let begin = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
         let end = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
         let instant = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
@@ -715,7 +722,7 @@ async fn exercise_catalog(storage: Storage) {
             },
             TimeType::Date => Window::Date { start: begin, end },
         };
-        let loaded = dkplus::replace_window(&cfg, &layout, &table, &window, vec![batch])
+        let loaded = dkplus::replace_window(&cfg, &layout, &window, vec![batch])
             .await
             .unwrap();
         assert_eq!(loaded.rows, 3);
@@ -836,10 +843,17 @@ async fn exercise_catalog(storage: Storage) {
         } else {
             chrono::Duration::hours(1)
         };
-        let candidates =
-            dkplus::maintenance::discover(&cfg, &layout, &discovery_table, granularity)
-                .await
-                .unwrap();
+        let discovery_layout = Layout::builder("weather", &discovery_table)
+            .with_time_column("observed")
+            .with_timezone(chrono_tz::Asia::Tokyo)
+            .with_sort_cols(vec!["observed".into()])
+            .without_row_grouping()
+            .resolve(&cfg)
+            .await
+            .unwrap();
+        let candidates = dkplus::maintenance::discover(&cfg, &discovery_layout, granularity)
+            .await
+            .unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].files.len(), 31);
         assert_eq!(candidates[0].begin.date(), begin);
