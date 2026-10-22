@@ -1,8 +1,13 @@
-//! Monthly candidate discovery; callers own scheduling and delivery.
+//! Candidate discovery and expired-file cleanup; callers own scheduling and snapshot expiry.
 use crate::{Config, Layout, TimeType, config::identifier, connect};
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDateTime;
 use tokio_postgres::GenericClient;
+
+mod cleanup;
+pub use cleanup::{
+    CleanupFile, CleanupOptions, CleanupReport, CleanupScope, cleanup_expired_files,
+};
 
 #[derive(Debug)]
 pub struct Candidate {

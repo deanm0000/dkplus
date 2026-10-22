@@ -99,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
     let job = dkplus::repack::Job {
         layout, table: "weather.observations".into(), begin_date: begin, end_date: end,
         unique: Some(vec!["station".into(), "observed".into()]), files: None,
+        expire_snapshot: dkplus::repack::ExpireSnapshot::Never,
     };
     dkplus::repack::run(&cfg, &job, &mut Vec::new()).await?;
     Ok(())
@@ -137,6 +138,393 @@ their request timezones differ. Locks cover the actual half-open range projected
 into that fixed lock timezone (date/naive domains use calendar dates). Existing
 applications can retain their old namespace/timezone for deployed-worker
 compatibility. Locks survive transactions and are released with the connection.
+
+## Using dkplus as a library
+
+The typical lifecycle is: build a `Config` (where the catalog and data live) and a
+`Layout` (per-table policy), write data with `replace_window`, then periodically
+compact with `maintenance::discover` and `repack::run`.
+
+### 1. Configure
+
+```rust,no_run
+use dkplus::{Config, Layout, Storage, TimeType};
+use dkplus::config::{DEFAULT_REPACK_NODE_BYTES, DEFAULT_REPACK_RUN_BYTES};
+
+fn build() -> anyhow::Result<(Config, Layout)> {
+    let cfg = Config {
+        postgres: "host=localhost user=ducklake dbname=catalog".parse()?,
+        storage: Storage::local(std::path::Path::new("/data/lake"))?,
+        repack_run_bytes: DEFAULT_REPACK_RUN_BYTES,   // external-sort run size
+        repack_node_bytes: DEFAULT_REPACK_NODE_BYTES, // merge-node memory budget
+    };
+    let layout = Layout {
+        schema: "weather".into(),
+        time_column: "observed".into(),
+        time_type: TimeType::TimestampTz,
+        timezone: chrono_tz::America::New_York,
+        lock_timezone: chrono_tz::UTC,
+        row_group_col: Some("station".into()),
+        sort_cols: vec!["station".into(), "observed".into()],
+        dedup_timestamp: "fetched_at".into(),
+        author: "weather-scraper".into(),
+        lock_namespace: "weather.repack".into(),
+    };
+    layout.validate()?;
+    Ok((cfg, layout))
+}
+```
+
+`Config` options:
+
+| Field | Meaning |
+|---|---|
+| `postgres` | `tokio_postgres::Config` for the DuckLake catalog (TLS via rustls/webpki roots). |
+| `storage` | `Storage::Azure { account, access_key }`, `Storage::local(dir)`, or `Storage::Store { root, store }`. |
+| `repack_run_bytes` | Size of in-memory sorted runs when repack falls back to external sorting (default 128 MiB). |
+| `repack_node_bytes` | Memory budget per merge node (default 256 MiB). |
+
+`Layout` options (all identifiers are validated; `Layout::default()` gives a
+UTC `timestamptz` layout on schema `main`, column `time`):
+
+| Field | Meaning |
+|---|---|
+| `schema` | Catalog schema; used for bare table names. |
+| `time_column`, `time_type` | Window column and its type: `TimeType::TimestampTz`, `Timestamp` or `Date`. |
+| `timezone` | Zone used to resolve repack date midnights (timestamptz only). |
+| `lock_timezone`, `lock_namespace` | Must be identical across all workers of a table (see locking above). |
+| `row_group_col` | Optional grouping column; must be the first of `sort_cols`. |
+| `sort_cols` | Ascending sort order of repacked files. |
+| `dedup_timestamp` | Microsecond timestamp column used when deduplicating. |
+| `author` | Recorded as the snapshot author. |
+
+### 2. Write to DuckLake
+
+`replace_window` atomically replaces the half-open window `[start, end)` with one
+new Parquet file and one catalog snapshot. Batches must be nonempty, share one
+schema, and use column names/types of the existing table.
+
+```rust,no_run
+use std::sync::Arc;
+use chrono::{TimeZone, Utc};
+use datafusion::arrow::{
+    array::{Int32Array, RecordBatch, TimestampMicrosecondArray},
+    datatypes::{DataType, Field, Schema, TimeUnit},
+};
+use dkplus::{Config, Layout, Window};
+
+async fn load(cfg: &Config, layout: &Layout) -> anyhow::Result<()> {
+    let ts = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("station", DataType::Int32, false),
+        Field::new("observed", ts, false),
+    ]));
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let batch = RecordBatch::try_new(schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2])),
+        Arc::new(
+            TimestampMicrosecondArray::from(vec![t0.timestamp_micros(); 2]).with_timezone("UTC"),
+        ),
+    ])?;
+
+    let window = Window::TimestampTz {
+        start: t0,
+        end: t0 + chrono::Duration::days(1),
+    };
+    let report = dkplus::replace_window(cfg, layout, "observations", &window, vec![batch]).await?;
+    println!(
+        "snapshot {} wrote {} rows to {}; retired {} files ({} rows), sql-deleted {:?}",
+        report.snapshot_id, report.rows, report.path,
+        report.retired_files.len(), report.retired_rows, report.sql_deleted,
+    );
+    Ok(())
+}
+```
+
+`LoadReport` fields: `snapshot_id`, `data_file_id`, `path`, `rows`,
+`file_size_bytes`, `retired_files` / `retired_rows` (files wholly inside the
+window, retired via `end_snapshot`) and `sql_deleted` (rows removed by
+pg_ducklake `DELETE` when a file straddles the window). Commit conflicts are
+retried automatically. Use `Window::Date` for `date` columns and
+`Window::Timestamp` for naive timestamps; the variant must match `Layout::time_type`.
+
+### 3. Maintenance: discover and repack
+
+`maintenance::discover` finds complete months whose files look like one file per
+day; `repack::run` compacts a range into sorted, optionally deduplicated files
+while preserving snapshots.
+
+```rust,no_run
+use dkplus::{Config, Layout, maintenance, repack};
+
+async fn compact(cfg: &Config, layout: &Layout) -> anyhow::Result<()> {
+    // One-hour granularity: files are expected to span whole hours.
+    let candidates =
+        maintenance::discover(cfg, layout, "observations", chrono::Duration::hours(1)).await?;
+
+    for c in candidates {
+        let job = repack::Job {
+            layout: layout.clone(),
+            table: "weather.observations".into(),
+            begin_date: c.begin.date(),
+            // `end` is an inclusive maximum; repack's end date is exclusive.
+            end_date: c.end.date().succ_opt().unwrap(),
+            unique: Some(vec!["station".into(), "observed".into()]), // None: no dedup
+            files: Some(c.files),                                    // freshness guard
+            expire_snapshot: repack::ExpireSnapshot::IfNoDedup,
+        };
+        job.validate()?;
+        let mut log = Vec::new();
+        repack::run(cfg, &job, &mut log).await?;
+        for line in log {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+```
+
+`repack::Job` options:
+
+| Field | Meaning |
+|---|---|
+| `table` | `table` or `schema.table` (letters, digits, underscores). |
+| `begin_date`, `end_date` | Calendar dates, `end_date` exclusive. |
+| `unique` | Key columns for deduplication; `None` disables it. Requires `Layout::dedup_timestamp`. |
+| `files` | Optional freshness guard of catalog paths; skip if none are current. |
+| `expire_snapshot` | `Never` (default), `IfNoDedup`, or `Always`; see snapshot expiry below. |
+| `layout` | Not serialized. Set it yourself after deserializing a queued job. |
+
+For custom transactions use `maintenance::table_candidates(&client, ...)`.
+Candidates are only a heuristic; they enqueue nothing.
+
+### How repack works
+
+**Selecting sources.** Repack reads the catalog (`ducklake.ducklake_*` tables in
+Postgres) and selects every *current* data file (`end_snapshot IS NULL`) of the
+table whose `Layout::time_column` statistics overlap `[begin_date, end_date)`, plus
+files whose min/max/null statistics are missing. File *names* are never parsed and
+no naming convention is assumed; overlap is decided purely from the catalog's
+per-file column min/max. Date boundaries are midnights: `Layout::timezone` for
+`timestamptz`, and plain wall-clock midnights for `timestamp`/`date` columns.
+
+**Rewriting.** Rows are split into three regions: *before* the range, *in-range*,
+and *after* (only the in-range region is deduplicated). Each region is written to
+its own new Parquet file (`ducklake-<uuidv7>.parquet`, ZSTD) in the table's data
+directory, sorted by `Layout::sort_cols` (ascending). Straddling files therefore
+keep their out-of-range rows. The time column must not contain nulls. Positional
+delete files are applied (deleted rows disappear from the output), and each row
+keeps its original `_ducklake_internal_row_id` and `_ducklake_internal_snapshot_id`
+so time travel and row identity are preserved.
+
+**Publishing (one catalog transaction, one new snapshot).** At `REPEATABLE READ`
+repack re-checks that the sources, table metadata and inlined data are unchanged,
+then:
+
+- inserts one new snapshot (id = previous + 1) with change
+  `compacted_table:<id>` (plus `deleted_from_table:<id>` if deduplication removed
+  rows), `Layout::author` and a commit message `repack <table> [begin, end) <tz>`;
+- sets `end_snapshot` on the source data files and their delete files (they are
+  *retired*, not deleted, so older snapshots still read them);
+- inserts the new data files and their per-column stats, and updates
+  `ducklake_table_stats` (file size, record count minus deduplicated rows).
+
+Commit conflicts retry up to 6 times; a changed source set or schema fails with a
+"retry the job" error.
+
+**Optional snapshot expiry.** Set `Job::expire_snapshot`:
+
+| Policy | Behavior |
+|---|---|
+| `ExpireSnapshot::Never` | Default: retain the previous snapshot. |
+| `ExpireSnapshot::IfNoDedup` | Expire only if `unique` is `None` (deduplication is disabled). |
+| `ExpireSnapshot::Always` | Expire even when deduplication changes logical data. |
+
+Serialized jobs use `"expire_snapshot": "never"`, `"if_no_dedup"` or `"always"`;
+omitting the field preserves the default. Existing Rust `Job` literals must add
+the field explicitly.
+
+Expiry happens **atomically in the repack publication transaction**: publishing
+snapshot 13 expires its immediate predecessor 12. If unrelated commits happen
+while sorting, the predecessor is the latest snapshot at publication—not the
+snapshot seen when the job started. Conflict retries recompute it. A skipped
+job or failed transaction does not expire anything. `IfNoDedup` means deduplication
+was not requested, not merely that it removed zero rows.
+
+**Snapshot expiry is catalog-wide**: opting in discards time travel to that
+version for every table. It does not expire older versions. Files replaced by
+this repack (including their positional-delete files) are queued for deletion
+only when no retained snapshot needs them. Consequently, expiring 12 does **not**
+necessarily reclaim its input files: snapshots 1–11 might still require them.
+Eligible files have their file metadata/statistics removed and absolute paths
+added to DuckLake's deletion queue, with a new scheduling timestamp. Snapshot
+change records are retained for conflict detection. This targeted operation
+does not collect unrelated obsolete catalog objects or inlined data; use native
+DuckLake expiry for general catalog garbage collection.
+
+No objects are physically deleted during expiry. Run
+`maintenance::cleanup_expired_files` later, with a cutoff old enough for active
+readers to finish. Enabling expiry takes additional catalog locks during
+publication, so it can temporarily block other writers/cleanup.
+
+**Cleanup.** Repack removes its own temporary sort runs (`<table dir>/_tmp/repack-*/`)
+and any unpublished outputs on failure. It does **not** physically delete retired
+source Parquet files. By default it does not expire snapshots; opt in above or expire them through DuckLake,
+then use `maintenance::cleanup_expired_files` (below) for queued files.
+After an uncertain commit failure candidate outputs
+are deliberately kept.
+
+**Not supported / preconditions.** Inlined rows in the range (flush them first),
+mapped, encrypted, partial or non-Parquet files, Puffin deletes, nested types, and
+column types outside the supported list below all fail with an error rather than
+being rewritten. An empty overlap or an already-completed `files` guard returns
+`Ok` without creating a snapshot.
+
+### Row groups per "node"
+
+A *node* is one distinct value of `Layout::row_group_col` (for example a station
+or device ID). You pick it once, in the `Layout`, and it must also be the first of
+`sort_cols`:
+
+```rust
+let layout = dkplus::Layout {
+    row_group_col: Some("station".into()),
+    sort_cols: vec!["station".into(), "observed".into()],
+    ..dkplus::Layout::default()
+};
+```
+
+Because files are sorted by the node first, each node's rows are contiguous and a
+row group's min/max statistics on that column make readers able to skip every
+other node. Packing depends on the region and range length:
+
+- **Outside regions, and ranges of one calendar month or longer:** *single-node*
+  row groups. A row group never mixes nodes; a node larger than the size target
+  (1,048,576 rows / ~128 MiB encoded) is split into several row groups, but a
+  small node still gets its own group.
+- **In-range region for shorter ranges:** nodes are never split across row groups
+  but several small nodes may share one group (flushed at a node boundary once the
+  target is reached; a single large node can exceed the target).
+- **No `row_group_col`:** size-based row groups only, with no node guarantee, and
+  the aligned fast path below is skipped.
+
+Node keys must be non-null and of a supported scalar type: `boolean`, signed and
+unsigned 8–64-bit integers, `float32/float64`, `varchar`, `date`, or microsecond
+`timestamp`/`timestamptz`. Nulls in the node column, unsupported types, or
+unsorted input cause an error or the slow path.
+
+**Fast path vs external sort.** If the sources were already written node-sorted
+(`row_group_col` leads `sort_cols`, and if deduplicating, `unique` includes the node
+column), repack tries an *aligned* merge that streams whole row groups, verifying
+actual values against statistics. When metadata, ordering or the
+`repack_node_bytes` budget doesn't fit, it falls back to a general external sort that
+spills sorted runs of about `repack_run_bytes` to the `_tmp` prefix, merges them and
+writes the final files. Both paths give the same result; the fast path just uses
+less I/O. Progress is logged to stderr and the `log` vector.
+
+### Supported column types
+
+`boolean`, `int8/16/32/64`, `uint8/16/32/64`, `float32/64`, `varchar`, `date`
+(Date32), `timestamp`/`timestamp_us` and `timestamptz` (microseconds). The time
+column must be `timestamptz`, `timestamp` or `date` to match `Layout::time_type`,
+and the dedup timestamp must be a microsecond timestamp.
+
+### Catalog assumptions
+
+- DuckLake 1.0 metadata lives in the Postgres schema `ducklake`; the table must
+  already exist and its schema is read from the catalog.
+- Window column statistics are present in `ducklake_file_column_stats`; for
+  `date` columns max values are treated as inclusive whole days.
+- Concurrent repacks of overlapping ranges serialise on Postgres advisory locks
+  keyed by `lock_namespace`, table and calendar day in `lock_timezone`.
+
+### Cleaning up expired files
+
+`maintenance::cleanup_expired_files` physically deletes files from DuckLake's
+`ducklake.ducklake_files_scheduled_for_deletion` queue. **Retired is not expired:**
+files retired by repack can still belong to retained snapshots. Expire those
+snapshots through DuckLake or opt in to repack's predecessor expiry first;
+this function does not expire snapshots, scan
+for orphaned files, or remove abandoned repack output.
+
+```rust,no_run
+use chrono::{Duration, Utc};
+use dkplus::{Config, maintenance::{
+    CleanupOptions, CleanupScope, cleanup_expired_files,
+}};
+
+async fn cleanup(cfg: &Config) -> anyhow::Result<()> {
+    let mut options = CleanupOptions {
+        scope: CleanupScope::Table {
+            schema: "weather".into(),
+            table: "observations".into(),
+        },
+        older_than: Utc::now() - Duration::days(7),
+        dry_run: true,
+    };
+    let preview = cleanup_expired_files(cfg, &options).await?;
+    for file in &preview.files {
+        println!("would delete {} (scheduled {})", file.path, file.schedule_start);
+    }
+
+    options.dry_run = false;
+    let report = cleanup_expired_files(cfg, &options).await?;
+    println!("deleted {}, already missing {}", report.deleted, report.already_missing);
+
+    // Same cutoff, across the entire catalog instead of one table.
+    options.scope = CleanupScope::Catalog;
+    let _catalog_report = cleanup_expired_files(cfg, &options).await?;
+    Ok(())
+}
+```
+
+- `older_than` is a **strict cutoff on `schedule_start`**, not file modification
+  time or snapshot time. Choose a delay longer than any active read transaction;
+  seven days above is an example, not an automatically enforced safety period.
+- `dry_run` resolves and validates candidates without deleting objects or queue
+  entries. The preview is not reserved: the subsequent call reselects candidates.
+- `CleanupReport::files` lists selected IDs, absolute paths, and schedule times.
+  `deleted` counts successful object-store delete calls; some stores treat an
+  already absent object as success. `already_missing` counts explicit `NotFound`
+  responses. Both counters are zero for dry runs.
+- The official queue has no table ID. Table scope uses the current table's data
+  directory and rejects overlapping directories belonging to other catalog
+  tables (including dropped tables). A root covering the whole configured store
+  is also rejected. Catalog scope includes queued files for dropped tables.
+  Table scope cannot attribute historical files outside the current directory;
+  use catalog scope for those.
+- Relative queue paths are relative to the **catalog's `data_path`**, unlike
+  data/delete-file metadata paths, which are relative to the table directory.
+  All paths must be accessible through `Config::storage`; invalid/out-of-root
+  paths fail explicitly.
+- Before any deletion, all candidates are checked against **all** data-file and
+  delete-file metadata, not just the current snapshot. Still-referenced files
+  cause an error even if someone incorrectly queued them.
+- Cleanup holds Postgres locks on the queue and relevant metadata throughout
+  deletion. It can block writers; schedule it accordingly. Run exclusively with
+  respect to other cleanup tools or direct object-store writers.
+- Objects are deleted before queue entries are removed. Storage/database errors
+  are returned with context. A failed call can have deleted some objects while
+  leaving their queue entries intact; retrying safely acknowledges missing files.
+  Cleanup does not create/increment a snapshot or change table statistics.
+
+### 4. Standalone Parquet and object stores
+
+`parquet::ParquetWriter` (see above) needs no catalog. To write to the same
+location a catalog path points at, resolve it:
+
+```rust,no_run
+use dkplus::Storage;
+
+fn resolve(storage: &Storage) -> anyhow::Result<()> {
+    let (store, key) = storage.resolve("az://container/lake/table/file.parquet")?;
+    let _ = (store, key); // feed into ParquetWriter::new(store, Path::from(key), ...)
+    Ok(())
+}
+```
+
+Errors are `anyhow::Result`; use `dkplus::connect(&cfg)` directly for a
+TLS-enabled `tokio_postgres::Client` when you need ad hoc catalog queries.
 
 ## Backends and scalar types
 
@@ -192,3 +580,10 @@ These tests cover memory/filesystem load and repack publication, all supported
 scalar mappings/statistics, date/naive/aware windows, typed grouping/fastpack,
 external sorting, deduplication, row IDs, exact group boundaries and thresholds.
 They create catalog fixtures, not real Azure queues or production data.
+
+Cleanup regressions use a separate **isolated, empty** Postgres database:
+
+```sh
+DKPLUS_CLEANUP_TEST_DATABASE_URL='postgresql://user@localhost/cleanup_testdb' \
+  cargo test --test cleanup -- --include-ignored
+```

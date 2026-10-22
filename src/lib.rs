@@ -175,20 +175,7 @@ async fn table_meta(c: &impl GenericClient, schema: &str, table: &str) -> Result
     let s_path: String = row.get(3);
     let s_rel: Option<bool> = row.get(4);
     let data_path: Option<String> = row.get(5);
-    let root = if t_rel == Some(true) {
-        let schema_dir = if s_rel == Some(true) {
-            join_dir(
-                &data_path.ok_or_else(|| anyhow!("catalog has no data_path"))?,
-                &s_path,
-            )
-        } else {
-            join_dir(&s_path, "")
-        };
-        join_dir(&schema_dir, &t_path)
-    } else {
-        join_dir(&t_path, "")
-    };
-
+    let root = catalog_table_root(&t_path, t_rel, &s_path, s_rel, data_path.as_deref())?;
     let partitioned: bool = c
         .query_one(
             "SELECT EXISTS (SELECT 1 FROM ducklake.ducklake_partition_info
@@ -225,6 +212,24 @@ async fn table_meta(c: &impl GenericClient, schema: &str, table: &str) -> Result
         root,
         columns,
     })
+}
+
+fn catalog_table_root(
+    table_path: &str,
+    table_relative: Option<bool>,
+    schema_path: &str,
+    schema_relative: Option<bool>,
+    data_path: Option<&str>,
+) -> Result<String> {
+    if table_relative != Some(true) {
+        return Ok(join_dir(table_path, ""));
+    }
+    let schema_dir = if schema_relative == Some(true) {
+        join_dir(data_path.context("catalog has no data_path")?, schema_path)
+    } else {
+        join_dir(schema_path, "")
+    };
+    Ok(join_dir(&schema_dir, table_path))
 }
 
 fn arrow_type_matches(catalog_ty: &str, dt: &DataType) -> bool {

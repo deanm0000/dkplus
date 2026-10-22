@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+mod expire;
 mod sort;
 
 const ROW_ID: &str = "_ducklake_internal_row_id";
@@ -52,6 +53,28 @@ async fn fast_wait<T: Send>(
     }
 }
 
+/// Whether a successful repack expires its immediate predecessor catalog snapshot.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpireSnapshot {
+    /// Expire even when deduplication can change logical data.
+    Always,
+    /// Expire only when deduplication is disabled (`unique` is `None`).
+    IfNoDedup,
+    #[default]
+    Never,
+}
+
+impl ExpireSnapshot {
+    fn is_never(&self) -> bool {
+        *self == Self::Never
+    }
+
+    fn enabled(self, unique: &Option<Vec<String>>) -> bool {
+        self == Self::Always || (self == Self::IfNoDedup && unique.is_none())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
@@ -64,6 +87,9 @@ pub struct Job {
     pub unique: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<String>>,
+    /// Catalog-wide expiry, committed atomically with the replacement snapshot.
+    #[serde(default, skip_serializing_if = "ExpireSnapshot::is_never")]
+    pub expire_snapshot: ExpireSnapshot,
 }
 
 impl Job {
@@ -1402,6 +1428,10 @@ async fn commit(
         .isolation_level(IsolationLevel::RepeatableRead)
         .start()
         .await?;
+    let expire = job.expire_snapshot.enabled(&job.unique);
+    if expire {
+        expire::lock(&tx).await?;
+    }
     let snap = tx
         .query_one(
             "SELECT snapshot_id, schema_version, next_catalog_id, next_file_id
@@ -1532,6 +1562,9 @@ async fn commit(
     if updated != 1 {
         bail!("table statistics missing while committing compaction");
     }
+    if expire {
+        expire::predecessor(&tx, meta, selected, prev).await?;
+    }
     tx.commit().await.context("committing repack snapshot")?;
     Ok(snapshot_id)
 }
@@ -1649,6 +1682,10 @@ pub async fn run(cfg: &Config, job: &Job, log: &mut Vec<String>) -> Result<()> {
         };
         progress(log, format!("committed compaction snapshot {snapshot}; retired {} files in {:.1}s",
             selected.len(), started.elapsed().as_secs_f64()));
+        if job.expire_snapshot.enabled(&job.unique) {
+            progress(log, format!("expired predecessor snapshot {} atomically with snapshot {snapshot}; \
+                replaced files needed by retained snapshots were preserved", snapshot - 1));
+        }
         Ok(())
     }.await;
     work.cleanup(log).await;
@@ -1853,6 +1890,7 @@ mod tests {
             end_date: "2026-02-01".parse().unwrap(),
             unique,
             files: None,
+            expire_snapshot: ExpireSnapshot::Never,
             layout: crate::test_support::layout(),
         }
     }
@@ -2712,6 +2750,40 @@ mod tests {
     }
 
     #[test]
+    fn expiry_policies_are_explicit_and_backward_compatible() {
+        let base = serde_json::json!({
+            "table": "rtprices", "begin_date": "2026-01-01", "end_date": "2026-02-01"
+        });
+        let default: Job = crate::test_support::job_from_value(base.clone()).unwrap();
+        assert_eq!(default.expire_snapshot, ExpireSnapshot::Never);
+        assert_eq!(serde_json::to_value(default).unwrap(), base);
+        for (policy, encoded, no_dedup, dedup) in [
+            (ExpireSnapshot::Always, "always", true, true),
+            (ExpireSnapshot::IfNoDedup, "if_no_dedup", true, false),
+            (ExpireSnapshot::Never, "never", false, false),
+        ] {
+            let mut payload = base.clone();
+            payload["expire_snapshot"] = serde_json::json!(encoded);
+            let job: Job = crate::test_support::job_from_value(payload).unwrap();
+            assert_eq!(job.expire_snapshot, policy);
+            assert_eq!(policy.enabled(&None), no_dedup);
+            assert_eq!(policy.enabled(&Some(vec!["node".into()])), dedup);
+            let encoded_job = serde_json::to_value(&job).unwrap();
+            let decoded: Job = crate::test_support::job_from_value(encoded_job).unwrap();
+            assert_eq!(decoded.expire_snapshot, policy);
+        }
+        for invalid in [
+            serde_json::json!("sometimes"),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            let mut payload = base.clone();
+            payload["expire_snapshot"] = invalid;
+            assert!(crate::test_support::job_from_value(payload).is_err());
+        }
+    }
+
+    #[test]
     fn optional_files_roundtrip_preserves_existing_jobs() {
         let base = serde_json::json!({
             "table": "rtprices", "begin_date": "2026-01-01", "end_date": "2026-02-01"
@@ -3023,6 +3095,7 @@ mod tests {
                 end_date: "2026-02-01".parse().unwrap(),
                 unique: None,
                 files: None,
+                expire_snapshot: ExpireSnapshot::Never,
                 layout: crate::test_support::layout(),
             };
             assert!(job.validate().is_err());
@@ -3078,6 +3151,7 @@ mod tests {
                 end_date: end.parse().unwrap(),
                 unique: None,
                 files: None,
+                expire_snapshot: ExpireSnapshot::Never,
                 layout: crate::test_support::layout(),
             };
             job.validate().unwrap();
@@ -3122,6 +3196,7 @@ mod tests {
             end_date: "2026-04-01".parse().unwrap(),
             unique: None,
             files: None,
+            expire_snapshot: ExpireSnapshot::Never,
             layout: crate::test_support::layout(),
         };
         assert!(job.node_only());
