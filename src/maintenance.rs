@@ -1,5 +1,5 @@
 //! Candidate discovery and expired-file cleanup; callers own scheduling and snapshot expiry.
-use crate::{Config, Layout, TimeType, config::identifier, connect};
+use crate::{Config, Table, TimeType, config::identifier, connect};
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDateTime;
 use tokio_postgres::GenericClient;
@@ -32,29 +32,29 @@ const CANDIDATES: &str = "
 /// candidate query so casts cannot be pushed down onto unrelated column stats.
 pub async fn table_candidates(
     client: &impl GenericClient,
-    layout: &Layout,
+    table: &Table,
     granularity: chrono::Duration,
 ) -> Result<Vec<Candidate>> {
-    layout.validate()?;
-    identifier(&layout.table)?;
+    table.validate()?;
+    identifier(&table.table)?;
     let seconds = granularity.num_seconds();
     if seconds <= 0 || granularity != chrono::Duration::seconds(seconds) {
         bail!("maintenance granularity must be a positive whole number of seconds");
     }
-    if layout.time_type == TimeType::Date && seconds % 86_400 != 0 {
+    if table.time_type == TimeType::Date && seconds % 86_400 != 0 {
         bail!("date maintenance granularity must be a whole number of days");
     }
-    let ty = layout.time_type.sql();
-    let local = |bound: &str| match layout.time_type {
+    let ty = table.time_type.sql();
+    let local = |bound: &str| match table.time_type {
         TimeType::TimestampTz => format!("s.{bound}::{ty} AT TIME ZONE $5"),
         TimeType::Timestamp | TimeType::Date => format!("s.{bound}::{ty}::timestamp"),
     };
     // Date files have inclusive date maxima rather than a final sub-day interval.
-    let max = match layout.time_type {
+    let max = match table.time_type {
         TimeType::Date => format!("({} + interval '23 hours')", local("max_value")),
         _ => local("max_value"),
     };
-    let elapsed = match layout.time_type {
+    let elapsed = match table.time_type {
         TimeType::Date => "s.max_value::date::timestamp - s.min_value::date::timestamp".to_string(),
         _ => format!("s.max_value::{ty} - s.min_value::{ty}"),
     };
@@ -74,16 +74,16 @@ pub async fn table_candidates(
            AND t.table_name = $2 AND c.column_name = $4",
         local("min_value")
     );
-    if layout.time_type == TimeType::TimestampTz {
+    if table.time_type == TimeType::TimestampTz {
         client
             .execute(
                 &sql,
                 &[
-                    &layout.schema,
-                    &layout.table,
+                    &table.schema,
+                    &table.table,
                     &seconds,
-                    &layout.time_column,
-                    &layout.timezone.name(),
+                    &table.time_column,
+                    &table.timezone.name(),
                 ],
             )
             .await?;
@@ -91,7 +91,7 @@ pub async fn table_candidates(
         client
             .execute(
                 &sql,
-                &[&layout.schema, &layout.table, &seconds, &layout.time_column],
+                &[&table.schema, &table.table, &seconds, &table.time_column],
             )
             .await?;
     }
@@ -113,14 +113,19 @@ pub async fn table_candidates(
 /// Owns one transaction, with the temporary table dropped on commit or rollback.
 pub async fn discover(
     cfg: &Config,
-    layout: &Layout,
+    table: &Table,
     granularity: chrono::Duration,
 ) -> Result<Vec<Candidate>> {
+    (cfg.log)(&format!("{table}: discovering maintenance candidates"));
     let mut client = connect(cfg).await?;
     let tx = client.transaction().await?;
-    let candidates = table_candidates(&tx, layout, granularity).await?;
+    let candidates = table_candidates(&tx, table, granularity).await?;
     tx.commit()
         .await
         .context("dropping maintenance temp table")?;
+    (cfg.log)(&format!(
+        "{table}: discovered {} maintenance candidates",
+        candidates.len()
+    ));
     Ok(candidates)
 }

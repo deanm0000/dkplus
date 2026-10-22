@@ -1,7 +1,7 @@
 use chrono::{NaiveDate, TimeZone, Utc};
 use datafusion::arrow::array::*;
 use datafusion::arrow::datatypes::{Field, Schema};
-use dkplus::{Config, Layout, Storage, TimeType, Window};
+use dkplus::{Config, Storage, Table, TimeType};
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory};
 use std::sync::Arc;
 
@@ -49,6 +49,19 @@ INSERT INTO ducklake.ducklake_snapshot VALUES (0, now(), 0, 1, 1);
 INSERT INTO ducklake.ducklake_schema VALUES (1, 'weather', 'weather/', true, NULL);
 ";
 
+async fn run(cfg: &Config, job: &dkplus::repack::Job, log: &mut Vec<String>) -> anyhow::Result<()> {
+    let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = messages.clone();
+    let mut job = job.clone();
+    job.table.cfg = cfg.clone();
+    job.table.cfg.log = Arc::new(move |message| {
+        captured.lock().unwrap().push(message.to_owned());
+    });
+    let result = job.run().await;
+    log.extend(messages.lock().unwrap().drain(..));
+    result
+}
+
 async fn expiry_fixture(
     client: &tokio_postgres::Client,
     postgres: &tokio_postgres::Config,
@@ -86,10 +99,11 @@ async fn expiry_fixture(
             root: "memory:///".into(),
             store: Arc::new(InMemory::new()),
         },
+        log: Arc::new(|message| eprintln!("{message}")),
         repack_run_bytes: 1,
         repack_node_bytes: 16 * 1024 * 1024,
     };
-    let layout = Layout::builder("weather", "observations")
+    let resolved_table = Table::builder("weather", "observations")
         .with_author("weather-loader")
         .resolve(&cfg)
         .await
@@ -114,18 +128,10 @@ async fn expiry_fixture(
         ),
     ])
     .unwrap();
-    let loaded = dkplus::replace_window(&cfg, &layout, &Window::Date { start, end }, vec![batch])
-        .await
-        .unwrap();
-    let job = dkplus::repack::Job {
-        layout,
-        table: "weather.observations".into(),
-        begin_date: start,
-        end_date: end,
-        unique: None,
-        files: None,
-        expire_snapshot: dkplus::repack::ExpireSnapshot::Never,
-    };
+    let loaded = resolved_table.replace_window(vec![batch]).await.unwrap();
+    let job = resolved_table
+        .repack(start, end)
+        .with_expire_snapshot(dkplus::repack::ExpireSnapshot::Never);
     (cfg, job, loaded)
 }
 
@@ -135,9 +141,79 @@ async fn count(client: &tokio_postgres::Client, sql: &str) -> i64 {
 
 #[tokio::test]
 #[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+async fn inferred_replacement_retires_inclusive_bounds_and_gaps() {
+    let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    let (_, job, initial) = expiry_fixture(&client, &postgres).await;
+    let mut table = job.table;
+    let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = messages.clone();
+    table.cfg.log = Arc::new(move |message| captured.lock().unwrap().push(message.to_owned()));
+    let batch = |date: &str| {
+        let date: NaiveDate = date.parse().unwrap();
+        let day = date
+            .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+            .num_days();
+        RecordBatch::try_from_iter([
+            (
+                "observed",
+                Arc::new(Date32Array::from(vec![i32::try_from(day).unwrap()])) as ArrayRef,
+            ),
+            ("station", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+            (
+                "fetched",
+                Arc::new(TimestampMicrosecondArray::from(vec![1])) as ArrayRef,
+            ),
+        ])
+        .unwrap()
+    };
+    let gap = table
+        .replace_window(vec![batch("2026-01-02")])
+        .await
+        .unwrap();
+    assert!(gap.retired_files.is_empty());
+    let batches = vec![batch("2026-01-03"), batch("2026-01-01")];
+    let replacement = table.replace_window(batches.clone()).await.unwrap();
+    let mut retired = replacement.retired_files.clone();
+    retired.sort_unstable();
+    assert_eq!(retired, vec![initial.data_file_id, gap.data_file_id]);
+    assert_eq!(replacement.retired_rows, 4);
+    assert_eq!(replacement.rows, 2);
+    let repeated = table.replace_window(batches).await.unwrap();
+    assert_eq!(repeated.retired_files, vec![replacement.data_file_id]);
+    assert_eq!(repeated.retired_rows, 2);
+    assert_eq!(
+        count(
+            &client,
+            "SELECT record_count FROM ducklake.ducklake_table_stats WHERE table_id=1"
+        )
+        .await,
+        2
+    );
+    assert!(
+        messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("committed replacement snapshot"))
+    );
+    client
+        .batch_execute("DROP SCHEMA ducklake CASCADE")
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
 async fn repack_expiry_policies_retention_and_atomicity() {
     use dkplus::maintenance::{CleanupOptions, CleanupScope, cleanup_expired_files};
-    use dkplus::repack::{ExpireSnapshot, run};
+    use dkplus::repack::ExpireSnapshot;
     use object_store::path::Path;
 
     let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
@@ -159,7 +235,7 @@ async fn repack_expiry_policies_retention_and_atomicity() {
                     job.unique = Some(vec!["station".into(), "observed".into()]);
                 }
                 if external {
-                    job.layout.row_group_col = None;
+                    job.table.row_group_col = None;
                 }
                 let expires = policy == ExpireSnapshot::Always
                     || (policy == ExpireSnapshot::IfNoDedup && !dedup);
@@ -609,6 +685,7 @@ async fn exercise_catalog(storage: Storage) {
     let cfg = Config {
         postgres,
         storage,
+        log: Arc::new(|message| eprintln!("{message}")),
         repack_run_bytes: 1,
         repack_node_bytes: 16 * 1024 * 1024,
     };
@@ -658,7 +735,7 @@ async fn exercise_catalog(storage: Storage) {
                 .await
                 .unwrap();
         }
-        let layout = Layout::builder("weather", &table)
+        let resolved_table = Table::builder("weather", &table)
             .with_time_column("observed")
             .with_timezone(chrono_tz::Asia::Tokyo)
             .with_row_group_col("station")
@@ -711,20 +788,7 @@ async fn exercise_catalog(storage: Storage) {
             .map(|(array, (name, _))| Field::new(name, array.data_type().clone(), true))
             .collect::<Vec<_>>();
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
-        let window = match kind {
-            TimeType::TimestampTz => Window::TimestampTz {
-                start: begin.and_hms_opt(0, 0, 0).unwrap().and_utc(),
-                end: end.and_hms_opt(0, 0, 0).unwrap().and_utc(),
-            },
-            TimeType::Timestamp => Window::Timestamp {
-                start: begin.and_hms_opt(0, 0, 0).unwrap(),
-                end: end.and_hms_opt(0, 0, 0).unwrap(),
-            },
-            TimeType::Date => Window::Date { start: begin, end },
-        };
-        let loaded = dkplus::replace_window(&cfg, &layout, &window, vec![batch])
-            .await
-            .unwrap();
+        let loaded = resolved_table.replace_window(vec![batch]).await.unwrap();
         assert_eq!(loaded.rows, 3);
         let stats = client.query_one("SELECT min_value,max_value FROM ducklake.ducklake_file_column_stats WHERE data_file_id=$1 AND column_id=2",
             &[&loaded.data_file_id]).await.unwrap();
@@ -755,17 +819,12 @@ async fn exercise_catalog(storage: Storage) {
             assert_eq!(row.get::<_, String>(0), min);
             assert_eq!(row.get::<_, String>(1), max);
         }
-        let job = dkplus::repack::Job {
-            layout: layout.clone(),
-            table: format!("weather.{table}"),
-            begin_date: begin,
-            end_date: end,
-            unique: Some(vec!["station".into(), "observed".into()]),
-            files: None,
-            expire_snapshot: dkplus::repack::ExpireSnapshot::Never,
-        };
+        let job = resolved_table
+            .repack(begin, end)
+            .with_unique(vec!["station".into(), "observed".into()])
+            .with_expire_snapshot(dkplus::repack::ExpireSnapshot::Never);
         let mut log = Vec::new();
-        dkplus::repack::run(&cfg, &job, &mut log).await.unwrap();
+        run(&cfg, &job, &mut log).await.unwrap();
         assert!(
             log.iter()
                 .any(|line| line.contains("aligned fastpack completed successfully"))
@@ -776,17 +835,34 @@ async fn exercise_catalog(storage: Storage) {
         assert_eq!(totals.get::<_, i64>(0), 1);
         assert_eq!(totals.get::<_, i64>(1), 3);
         // A second pass exercises reading preserved IDs and typed group statistics.
-        dkplus::repack::run(&cfg, &job, &mut log).await.unwrap();
+        run(&cfg, &job, &mut log).await.unwrap();
         let mut external = job.clone();
-        external.layout.row_group_col = None;
+        external.table.row_group_col = None;
         let mut external_log = Vec::new();
-        dkplus::repack::run(&cfg, &external, &mut external_log)
-            .await
-            .unwrap();
+        run(&cfg, &external, &mut external_log).await.unwrap();
         assert!(
             external_log
                 .iter()
                 .any(|line| line.contains("merging in-range region"))
+        );
+        let previous: i64 = client
+            .query_one(
+                "SELECT max(snapshot_id) FROM ducklake.ducklake_snapshot",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        resolved_table.repack_now(begin, end).await.unwrap();
+        assert_eq!(
+            count(
+                &client,
+                &format!(
+                    "SELECT count(*) FROM ducklake.ducklake_snapshot WHERE snapshot_id={previous}"
+                )
+            )
+            .await,
+            0
         );
         let authors = client.query_one("SELECT count(*) FROM ducklake.ducklake_snapshot_changes WHERE author <> 'weather-loader'", &[]).await.unwrap();
         assert_eq!(authors.get::<_, i64>(0), 0);
@@ -815,7 +891,7 @@ async fn exercise_catalog(storage: Storage) {
             let naive = date.and_hms_opt(0, 0, 0).unwrap();
             let (min, max) = match kind {
                 TimeType::TimestampTz => {
-                    let min = layout
+                    let min = resolved_table
                         .timezone
                         .from_local_datetime(&naive)
                         .single()
@@ -843,7 +919,7 @@ async fn exercise_catalog(storage: Storage) {
         } else {
             chrono::Duration::hours(1)
         };
-        let discovery_layout = Layout::builder("weather", &discovery_table)
+        let discovery_table_config = Table::builder("weather", &discovery_table)
             .with_time_column("observed")
             .with_timezone(chrono_tz::Asia::Tokyo)
             .with_sort_cols(vec!["observed".into()])
@@ -851,7 +927,7 @@ async fn exercise_catalog(storage: Storage) {
             .resolve(&cfg)
             .await
             .unwrap();
-        let candidates = dkplus::maintenance::discover(&cfg, &discovery_layout, granularity)
+        let candidates = dkplus::maintenance::discover(&cfg, &discovery_table_config, granularity)
             .await
             .unwrap();
         assert_eq!(candidates.len(), 1);
@@ -874,7 +950,7 @@ async fn exercise_catalog(storage: Storage) {
             .await
             .unwrap();
         assert!(
-            dkplus::repack::run(&cfg, &job, &mut log)
+            run(&cfg, &job, &mut log)
                 .await
                 .unwrap_err()
                 .to_string()

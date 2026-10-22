@@ -1,8 +1,8 @@
 use crate::*;
 use datafusion::arrow::datatypes::SchemaRef;
 
-pub fn layout() -> Layout {
-    Layout {
+pub fn table() -> Table {
+    Table {
         schema: "ciso".into(),
         table: "rtprices".into(),
         time_column: "utcbegin".into(),
@@ -13,21 +13,31 @@ pub fn layout() -> Layout {
         timezone: chrono_tz::America::Los_Angeles,
         author: Some("fixture".into()),
         lock_namespace: "rustciso.repack".into(),
-        ..Layout::default()
+        ..Table::default()
     }
 }
 
 pub fn job_from_value(value: serde_json::Value) -> serde_json::Result<repack::Job> {
+    let qualified = value["table"]
+        .as_str()
+        .is_some_and(|name| name.contains('.'));
     let mut job: repack::Job = serde_json::from_value(value)?;
-    let mut layout = layout();
-    if let Some((schema, table)) = job.table.split_once('.') {
-        layout.schema = schema.into();
-        layout.table = table.into();
-    } else {
-        layout.table = job.table.clone();
+    let mut table = table();
+    if qualified {
+        table.schema = job.table.schema.clone();
     }
-    job.layout = layout;
+    table.table = job.table.table.clone();
+    job.table = table;
     Ok(job)
+}
+
+pub fn captured_log() -> (Log, Arc<std::sync::Mutex<Vec<String>>>) {
+    let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = messages.clone();
+    (
+        Arc::new(move |message| captured.lock().unwrap().push(message.into())),
+        messages,
+    )
 }
 
 pub fn target_schema(prefix: &str) -> SchemaRef {

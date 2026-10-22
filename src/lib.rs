@@ -4,9 +4,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use config::identifier;
-pub use config::{Config, Layout, LayoutBuilder, Storage, TimeType, Window};
+pub use config::{Config, Log, Storage, Table, TableBuilder, TimeType};
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit, TimestampMicrosecondType};
+use datafusion::arrow::datatypes::{
+    DataType, Date32Type, Field, Schema, TimeUnit, TimestampMicrosecondType,
+};
 use datafusion::parquet::arrow::arrow_writer::ArrowWriterOptions;
 use datafusion::parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use datafusion::parquet::basic::{Compression, ZstdLevel};
@@ -93,9 +95,10 @@ pub async fn connect(cfg: &Config) -> Result<Client> {
         .connect(tls)
         .await
         .context("connecting to postgres")?;
+    let log = cfg.log.clone();
     tokio::spawn(async move {
         if let Err(e) = conn.await {
-            eprintln!("postgres connection error: {e}");
+            log(&format!("postgres connection error: {e}"));
         }
     });
     Ok(client)
@@ -116,7 +119,7 @@ fn join_dir(base: &str, rel: &str) -> String {
 async fn has_inlined_rows(
     c: &impl GenericClient,
     table_id: i64,
-    layout: &Layout,
+    table: &Table,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<bool> {
@@ -135,14 +138,14 @@ async fn has_inlined_rows(
                     "SELECT EXISTS (SELECT 1 FROM ducklake.\"{}\" WHERE end_snapshot IS NULL
                        AND {}::{} >= $1::text::{} AND {}::{} < $2::text::{})",
                     name.replace('"', "\"\""),
-                    identifier(&layout.time_column)?,
-                    layout.time_type.sql(),
-                    layout.time_type.sql(),
-                    identifier(&layout.time_column)?,
-                    layout.time_type.sql(),
-                    layout.time_type.sql()
+                    identifier(&table.time_column)?,
+                    table.time_type.sql(),
+                    table.time_type.sql(),
+                    identifier(&table.time_column)?,
+                    table.time_type.sql(),
+                    table.time_type.sql()
                 ),
-                &[&layout.bound(start), &layout.bound(end)],
+                &[&table.bound(start), &table.bound(end)],
             )
             .await
             .with_context(|| format!("checking inlined rows in {name}"))?
@@ -292,7 +295,7 @@ fn overridden_tag<T: serde::de::DeserializeOwned>(
     }
 }
 
-pub(crate) async fn resolve_layout(cfg: &Config, builder: LayoutBuilder) -> Result<Layout> {
+pub(crate) async fn resolve_table(cfg: &Config, builder: TableBuilder) -> Result<Table> {
     identifier(&builder.schema)?;
     identifier(&builder.table)?;
     let mut client = connect(cfg).await?;
@@ -307,14 +310,15 @@ pub(crate) async fn resolve_layout(cfg: &Config, builder: LayoutBuilder) -> Resu
     tx.commit()
         .await
         .context("finishing table policy read transaction")?;
-    resolve_layout_settings(builder, &meta, &tags)
+    resolve_table_settings(cfg, builder, &meta, &tags)
 }
 
-fn resolve_layout_settings(
-    builder: LayoutBuilder,
+fn resolve_table_settings(
+    cfg: &Config,
+    builder: TableBuilder,
     meta: &TableMeta,
     tags: &HashMap<String, String>,
-) -> Result<Layout> {
+) -> Result<Table> {
     let time_column = overridden_tag(builder.time_column, tags, TAG_TIME_COLUMN)?
         .context("missing required table setting \"time_column\"")?;
     let timezone = match builder.timezone {
@@ -349,7 +353,8 @@ fn resolve_layout_settings(
             bail!("configured time column {time_column:?} must be a date or microsecond timestamp")
         }
     };
-    let layout = Layout {
+    let table = Table {
+        cfg: cfg.clone(),
         schema: builder.schema,
         table: builder.table.clone(),
         time_column,
@@ -362,23 +367,23 @@ fn resolve_layout_settings(
         author: builder.author,
         lock_namespace: builder.lock_namespace.unwrap_or(builder.table),
     };
-    layout.validate()?;
-    for name in std::iter::once(layout.time_column.as_str())
-        .chain(layout.row_group_col.as_deref())
-        .chain(layout.sort_cols.iter().map(String::as_str))
+    table.validate()?;
+    for name in std::iter::once(table.time_column.as_str())
+        .chain(table.row_group_col.as_deref())
+        .chain(table.sort_cols.iter().map(String::as_str))
         .chain(
-            layout
+            table
                 .unique_by_cols
                 .iter()
                 .flat_map(|cols| cols.iter().map(String::as_str)),
         )
-        .chain(layout.dedup_timestamp.as_deref())
+        .chain(table.dedup_timestamp.as_deref())
     {
         if !meta.columns.contains_key(name) {
             bail!("configured column {name:?} is not in table");
         }
     }
-    if let Some(timestamp) = &layout.dedup_timestamp
+    if let Some(timestamp) = &table.dedup_timestamp
         && !matches!(
             types::arrow_type(&meta.columns[timestamp].ty)?,
             DataType::Timestamp(TimeUnit::Microsecond, _)
@@ -386,14 +391,14 @@ fn resolve_layout_settings(
     {
         bail!("dedup timestamp column {timestamp:?} must be a microsecond timestamp");
     }
-    if let Some(unique) = &layout.unique_by_cols {
+    if let Some(unique) = &table.unique_by_cols {
         for name in unique {
             if !meta.columns.contains_key(name) {
                 bail!("configured unique column {name:?} is not in table");
             }
         }
     }
-    Ok(layout)
+    Ok(table)
 }
 
 fn arrow_type_matches(catalog_ty: &str, dt: &DataType) -> bool {
@@ -533,8 +538,7 @@ enum Attempt {
 
 async fn try_register(
     client: &mut Client,
-    table: &str,
-    layout: &Layout,
+    table: &Table,
     meta: &TableMeta,
     utc_col: i64,
     start: DateTime<Utc>,
@@ -569,14 +573,9 @@ async fn try_register(
                LEFT JOIN ducklake.ducklake_file_column_stats s
                  ON s.data_file_id = f.data_file_id AND s.table_id = f.table_id AND s.column_id = $2
               WHERE f.table_id = $1 AND f.end_snapshot IS NULL",
-                ty = layout.time_type.sql()
+                ty = table.time_type.sql()
             ),
-            &[
-                &table_id,
-                &utc_col,
-                &layout.bound(start),
-                &layout.bound(end),
-            ],
+            &[&table_id, &utc_col, &table.bound(start), &table.bound(end)],
         )
         .await
         .context("reading live data files")?;
@@ -596,7 +595,7 @@ async fn try_register(
         }
     }
 
-    if has_inlined_rows(&tx, table_id, layout, start, end).await? {
+    if has_inlined_rows(&tx, table_id, table, start, end).await? {
         return Ok(Attempt::NeedsSqlDelete);
     }
 
@@ -620,11 +619,7 @@ async fn try_register(
     if !retire.is_empty() {
         changes.push_str(&format!(",deleted_from_table:{table_id}"));
     }
-    let message = format!(
-        "{}.{table} {}",
-        layout.schema,
-        start.format("%Y-%m-%dT%H:%MZ")
-    );
+    let message = format!("{table} {}", start.format("%Y-%m-%dT%H:%MZ"));
     tx.execute(
         "INSERT INTO ducklake.ducklake_snapshot_changes
            (snapshot_id, changes_made, author, commit_message, commit_extra_info)
@@ -632,7 +627,7 @@ async fn try_register(
         &[
             &snapshot_id,
             &changes,
-            &layout.author_for("writer", start, end),
+            &table.author_for("writer", start, end),
             &message,
         ],
     )
@@ -769,7 +764,15 @@ async fn update_table_stats(
         .await?;
     }
 
-    let existing: HashMap<i64, (Option<bool>, Option<bool>, Option<String>, Option<String>)> = tx
+    #[derive(Clone)]
+    struct ColumnSummary {
+        contains_null: Option<bool>,
+        contains_nan: Option<bool>,
+        min: Option<String>,
+        max: Option<String>,
+    }
+
+    let existing: HashMap<i64, ColumnSummary> = tx
         .query(
             "SELECT column_id, contains_null, contains_nan, min_value, max_value
                FROM ducklake.ducklake_table_column_stats WHERE table_id = $1",
@@ -777,7 +780,17 @@ async fn update_table_stats(
         )
         .await?
         .into_iter()
-        .map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3), r.get(4))))
+        .map(|r| {
+            (
+                r.get(0),
+                ColumnSummary {
+                    contains_null: r.get(1),
+                    contains_nan: r.get(2),
+                    min: r.get(3),
+                    max: r.get(4),
+                },
+            )
+        })
         .collect();
     tx.execute(
         "DELETE FROM ducklake.ducklake_table_column_stats WHERE table_id = $1",
@@ -794,7 +807,12 @@ async fn update_table_stats(
                 s.min.clone(),
                 s.max.clone(),
             ),
-            Some((cn, cnan, lo, hi)) => (
+            Some(ColumnSummary {
+                contains_null: cn,
+                contains_nan: cnan,
+                min: lo,
+                max: hi,
+            }) => (
                 cn.map(|v| v || file_null),
                 match (cnan, s.contains_nan) {
                     (Some(a), Some(b)) => Some(a || b),
@@ -835,87 +853,134 @@ fn is_commit_conflict(e: &anyhow::Error) -> bool {
 /// Fallback for windows whose rows share files with other hours: let pg_ducklake delete them.
 async fn sql_delete(
     client: &Client,
-    table: &str,
-    layout: &Layout,
+    table: &Table,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<u64> {
     let sql = format!(
         "DELETE FROM {}.{} WHERE {} >= $1::text::{} AND {} < $2::text::{}",
-        identifier(&layout.schema)?,
-        identifier(table)?,
-        identifier(&layout.time_column)?,
-        layout.time_type.sql(),
-        identifier(&layout.time_column)?,
-        layout.time_type.sql()
+        identifier(&table.schema)?,
+        identifier(&table.table)?,
+        identifier(&table.time_column)?,
+        table.time_type.sql(),
+        identifier(&table.time_column)?,
+        table.time_type.sql()
     );
     client
-        .execute(&sql, &[&layout.bound(start), &layout.bound(end)])
+        .execute(&sql, &[&table.bound(start), &table.bound(end)])
         .await
         .context("pg_ducklake DELETE for window")
 }
 
-/// Replace a typed half-open window with one new Parquet file and catalog snapshot.
-pub async fn replace_window(
-    cfg: &Config,
-    layout: &Layout,
-    window: &Window,
-    batches: Vec<RecordBatch>,
-) -> Result<LoadReport> {
-    layout.validate()?;
-    let (start, end) = window.bounds(layout)?;
-    let batches: Vec<_> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
-    if batches.is_empty() {
-        bail!("no rows to load for {start}");
-    }
-    let mut client = connect(cfg).await?;
-    let meta = table_meta(&client, &layout.schema, &layout.table).await?;
-    let cols = resolve_columns(&meta, &batches[0].schema())?;
-    let utc_col = meta
-        .columns
-        .get(&layout.time_column)
-        .context("table has no configured window column")?;
-    if types::arrow_type(&utc_col.ty)? != types::arrow_type(layout.time_type.sql())? {
-        bail!("window column type does not match layout");
-    }
-    for batch in &batches {
-        resolve_columns(&meta, &batch.schema())?;
-        if batch.schema() != batches[0].schema() {
-            bail!("load batch schemas differ");
+impl Table {
+    fn replacement_bounds(
+        &self,
+        batches: &[RecordBatch],
+    ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+        let mut minimum = None::<i64>;
+        let mut maximum = None::<i64>;
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let column = batch.column(batch.schema().index_of(&self.time_column)?);
+            if column.null_count() != 0 {
+                bail!("replacement time column must not contain nulls");
+            }
+            let (lo, hi) = match (self.time_type, column.data_type()) {
+                (TimeType::Date, DataType::Date32) => {
+                    let values = column.as_primitive::<Date32Type>();
+                    (
+                        datafusion::arrow::compute::min(values).map(i64::from),
+                        datafusion::arrow::compute::max(values).map(i64::from),
+                    )
+                }
+                (TimeType::TimestampTz, DataType::Timestamp(TimeUnit::Microsecond, Some(_)))
+                | (TimeType::Timestamp, DataType::Timestamp(TimeUnit::Microsecond, None)) => {
+                    let values = column.as_primitive::<TimestampMicrosecondType>();
+                    (
+                        datafusion::arrow::compute::min(values),
+                        datafusion::arrow::compute::max(values),
+                    )
+                }
+                _ => bail!("replacement time column type does not match table"),
+            };
+            if let (Some(lo), Some(hi)) = (lo, hi) {
+                minimum = Some(minimum.map_or(lo, |value| value.min(lo)));
+                maximum = Some(maximum.map_or(hi, |value| value.max(hi)));
+            }
         }
+        let start = minimum.context("no rows to load")?;
+        let end = maximum
+            .context("no rows to load")?
+            .checked_add(1)
+            .context("replacement window end is out of range")?;
+        let convert = |value| match self.time_type {
+            TimeType::Date => chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                .unwrap()
+                .checked_add_signed(chrono::Duration::days(value))
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|time| time.and_utc()),
+            _ => DateTime::from_timestamp_micros(value),
+        };
+        Ok((
+            convert(start).context("replacement window start is out of range")?,
+            convert(end).context("replacement window end is out of range")?,
+        ))
     }
-    let (buf, pq) = write_parquet(&batches, &cols)?;
-    let name = format!("ducklake-{}.parquet", Uuid::now_v7());
-    let file = file_info(name, &buf, &pq, &batches, &cols)?;
-    let (store, prefix) = object_store_for(cfg, &meta.root)?;
-    let obj = ObjPath::from(format!("{prefix}{}", file.name));
-    store
-        .put(&obj, PutPayload::from(Bytes::from(buf)))
-        .await
-        .with_context(|| format!("uploading {}{}", meta.root, file.name))?;
-    let result = register(
-        &mut client,
-        &layout.table,
-        layout,
-        &meta,
-        utc_col.id,
-        start,
-        end,
-        &file,
-    )
-    .await;
-    if result.is_err() {
-        if let Err(e) = store.delete(&obj).await {
-            eprintln!("could not remove orphaned {obj}: {e}");
+
+    /// Replace the range from the minimum through maximum input time, inclusive.
+    /// The half-open upper bound is one day (date) or microsecond (timestamp) later.
+    pub async fn replace_window(&self, batches: Vec<RecordBatch>) -> Result<LoadReport> {
+        let table = self;
+        let cfg = &self.cfg;
+        self.validate()?;
+        let batches: Vec<_> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
+        let (start, end) = self.replacement_bounds(&batches)?;
+        for batch in &batches {
+            if batch.schema() != batches[0].schema() {
+                bail!("load batch schemas differ");
+            }
         }
+        (cfg.log)(&format!("{self} [{start}, {end}): replacing window"));
+        let mut client = connect(cfg).await?;
+        let meta = table_meta(&client, &table.schema, &table.table).await?;
+        let cols = resolve_columns(&meta, &batches[0].schema())?;
+        let utc_col = meta
+            .columns
+            .get(&table.time_column)
+            .context("table has no configured window column")?;
+        if types::arrow_type(&utc_col.ty)? != types::arrow_type(table.time_type.sql())? {
+            bail!("window column type does not match table");
+        }
+        let (buf, pq) = write_parquet(&batches, &cols)?;
+        let name = format!("ducklake-{}.parquet", Uuid::now_v7());
+        let file = file_info(name, &buf, &pq, &batches, &cols)?;
+        let (store, prefix) = object_store_for(cfg, &meta.root)?;
+        let obj = ObjPath::from(format!("{prefix}{}", file.name));
+        store
+            .put(&obj, PutPayload::from(Bytes::from(buf)))
+            .await
+            .with_context(|| format!("uploading {}{}", meta.root, file.name))?;
+        let result = register(&mut client, table, &meta, utc_col.id, start, end, &file).await;
+        if result.is_err()
+            && let Err(e) = store.delete(&obj).await
+        {
+            (cfg.log)(&format!("could not remove orphaned {obj}: {e}"));
+        }
+        if let Ok(report) = &result {
+            (cfg.log)(&format!(
+                "{self}: committed replacement snapshot {}; wrote {} rows",
+                report.snapshot_id, report.rows
+            ));
+        }
+        result
     }
-    result
 }
 
 async fn register(
     client: &mut Client,
-    table: &str,
-    layout: &Layout,
+    table: &Table,
     meta: &TableMeta,
     utc_col: i64,
     start: DateTime<Utc>,
@@ -924,7 +989,7 @@ async fn register(
 ) -> Result<LoadReport> {
     let mut sql_deleted = None;
     for attempt in 1..=MAX_COMMIT_ATTEMPTS {
-        match try_register(client, table, layout, meta, utc_col, start, end, file).await {
+        match try_register(client, table, meta, utc_col, start, end, file).await {
             Ok(Attempt::Done(mut report)) => {
                 report.sql_deleted = sql_deleted;
                 return Ok(report);
@@ -933,10 +998,12 @@ async fn register(
                 if sql_deleted.is_some() {
                     bail!("rows for {start} still present after pg_ducklake DELETE");
                 }
-                sql_deleted = Some(sql_delete(client, table, layout, start, end).await?);
+                sql_deleted = Some(sql_delete(client, table, start, end).await?);
             }
             Err(e) if is_commit_conflict(&e) && attempt < MAX_COMMIT_ATTEMPTS => {
-                eprintln!("ducklake commit conflict (attempt {attempt}), retrying: {e:#}");
+                (table.cfg.log)(&format!(
+                    "ducklake commit conflict (attempt {attempt}), retrying: {e:#}"
+                ));
                 tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64)).await;
             }
             Err(e) => return Err(e),
@@ -949,9 +1016,132 @@ async fn register(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use datafusion::arrow::array::{ArrayRef, Date32Array, TimestampMicrosecondArray};
+
+    fn replacement_batch(table: &Table, values: Vec<i64>) -> RecordBatch {
+        let column: ArrayRef = match table.time_type {
+            TimeType::Date => Arc::new(Date32Array::from(
+                values
+                    .into_iter()
+                    .map(|value| i32::try_from(value).unwrap())
+                    .collect::<Vec<_>>(),
+            )),
+            TimeType::Timestamp => Arc::new(TimestampMicrosecondArray::from(values)),
+            TimeType::TimestampTz => {
+                Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC"))
+            }
+        };
+        RecordBatch::try_from_iter([(table.time_column.as_str(), column)]).unwrap()
+    }
 
     #[test]
-    fn table_layout_uses_tags_and_explicit_overrides() {
+    fn replacement_bounds_span_every_batch_and_include_the_maximum() {
+        for kind in [TimeType::Date, TimeType::Timestamp, TimeType::TimestampTz] {
+            let table = Table {
+                time_type: kind,
+                timezone: chrono_tz::America::Los_Angeles,
+                ..crate::test_support::table()
+            };
+            let batches = vec![
+                replacement_batch(&table, vec![]),
+                replacement_batch(&table, vec![5, -2, 3]),
+                replacement_batch(&table, vec![9, 1]),
+            ];
+            let (start, end) = table.replacement_bounds(&batches).unwrap();
+            let unit = if kind == TimeType::Date {
+                86_400_000_000
+            } else {
+                1
+            };
+            assert_eq!(start.timestamp_micros(), -2 * unit);
+            assert_eq!(end.timestamp_micros(), 10 * unit);
+            let (start, end) = table
+                .replacement_bounds(&[replacement_batch(&table, vec![4])])
+                .unwrap();
+            assert_eq!(end.timestamp_micros() - start.timestamp_micros(), unit);
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_invalid_input_before_connecting() {
+        let table = crate::test_support::table();
+        for batches in [vec![], vec![replacement_batch(&table, vec![])]] {
+            assert!(
+                table
+                    .replace_window(batches)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no rows")
+            );
+        }
+        let column =
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(1), None]).with_timezone("UTC"))
+                as ArrayRef;
+        let batch = RecordBatch::try_from_iter([(table.time_column.as_str(), column)]).unwrap();
+        assert!(
+            table
+                .replace_window(vec![batch])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("nulls")
+        );
+        let wrong_type = Table {
+            time_type: TimeType::Date,
+            ..table.clone()
+        };
+        assert!(
+            table
+                .replace_window(vec![replacement_batch(&wrong_type, vec![1])])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("type")
+        );
+        assert!(
+            table
+                .replace_window(vec![replacement_batch(&table, vec![i64::MAX])])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("out of range")
+        );
+        let date_table = Table {
+            time_type: TimeType::Date,
+            ..table.clone()
+        };
+        assert!(
+            date_table
+                .replacement_bounds(&[replacement_batch(&date_table, vec![i64::from(i32::MAX)])])
+                .is_err()
+        );
+        let mut other = table.clone();
+        other.time_column = "other".into();
+        assert!(
+            table
+                .replace_window(vec![replacement_batch(&other, vec![1])])
+                .await
+                .is_err()
+        );
+        let first = replacement_batch(&table, vec![1]);
+        let extra = RecordBatch::try_from_iter([
+            (table.time_column.as_str(), first.column(0).clone()),
+            ("extra", first.column(0).clone()),
+        ])
+        .unwrap();
+        assert!(
+            table
+                .replace_window(vec![first, extra])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("schemas differ")
+        );
+    }
+
+    #[test]
+    fn table_policy_uses_tags_and_explicit_overrides() {
         let meta = TableMeta {
             table_id: 9,
             root: String::new(),
@@ -990,8 +1180,9 @@ mod tests {
             ),
             (TAG_DEDUP_TIMESTAMP.into(), "\"fetched_at\"".into()),
         ]);
-        let layout = resolve_layout_settings(
-            Layout::builder("weather", "observations")
+        let table = resolve_table_settings(
+            &Table::default().cfg,
+            Table::builder("weather", "observations")
                 .with_time_column("observed")
                 .with_timezone(chrono_tz::UTC)
                 .with_row_group_col("station")
@@ -1001,21 +1192,22 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(layout.time_type, TimeType::Date);
-        assert_eq!(layout.time_column, "observed");
-        assert_eq!(layout.timezone, chrono_tz::UTC);
-        assert_eq!(layout.row_group_col.as_deref(), Some("station"));
-        assert_eq!(layout.sort_cols, ["station", "observed"]);
+        assert_eq!(table.time_type, TimeType::Date);
+        assert_eq!(table.time_column, "observed");
+        assert_eq!(table.timezone, chrono_tz::UTC);
+        assert_eq!(table.row_group_col.as_deref(), Some("station"));
+        assert_eq!(table.sort_cols, ["station", "observed"]);
         assert_eq!(
-            layout.unique_by_cols.as_deref(),
+            table.unique_by_cols.as_deref(),
             Some(["station".to_string(), "observed".to_string()].as_slice())
         );
-        assert_eq!(layout.dedup_timestamp.as_deref(), Some("fetched_at"));
-        assert_eq!(layout.lock_namespace, "weather.repack");
-        assert_eq!(layout.author, None);
+        assert_eq!(table.dedup_timestamp.as_deref(), Some("fetched_at"));
+        assert_eq!(table.lock_namespace, "weather.repack");
+        assert_eq!(table.author, None);
 
-        let optional_overrides = resolve_layout_settings(
-            Layout::builder("weather", "observations")
+        let optional_overrides = resolve_table_settings(
+            &Table::default().cfg,
+            Table::builder("weather", "observations")
                 .with_time_column("observed")
                 .with_timezone(chrono_tz::UTC)
                 .with_sort_cols(vec!["station".into(), "observed".into()])
@@ -1040,14 +1232,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_layout_tags_fail() {
+    fn missing_required_table_tags_fail() {
         let meta = TableMeta {
             table_id: 1,
             root: String::new(),
             columns: HashMap::new(),
         };
-        let error = resolve_layout_settings(
-            Layout::builder("weather", "observations"),
+        let error = resolve_table_settings(
+            &Table::default().cfg,
+            Table::builder("weather", "observations"),
             &meta,
             &HashMap::new(),
         )
@@ -1068,12 +1261,12 @@ mod tests {
             .await
             .unwrap();
         for kind in [TimeType::TimestampTz, TimeType::Timestamp, TimeType::Date] {
-            let layout = Layout {
+            let table = Table {
                 schema: "pg_temp".into(),
                 table: "records".into(),
                 time_column: "event time".into(),
                 time_type: kind,
-                ..Layout::default()
+                ..Table::default()
             };
             client.batch_execute(&format!(
                 "CREATE TEMP TABLE records (\"event time\" {});
@@ -1086,12 +1279,7 @@ mod tests {
             let end = DateTime::parse_from_rfc3339("2026-01-03T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc);
-            assert_eq!(
-                sql_delete(&client, "records", &layout, start, end)
-                    .await
-                    .unwrap(),
-                1
-            );
+            assert_eq!(sql_delete(&client, &table, start, end).await.unwrap(), 1);
             assert_eq!(
                 client
                     .query_one("SELECT count(*) FROM records", &[])

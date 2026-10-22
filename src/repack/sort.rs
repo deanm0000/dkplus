@@ -194,11 +194,7 @@ impl RowGroupFile {
                     "row group {index} has an invalid uncompressed size"
                 )));
             };
-            bounds.push(RowGroupBounds {
-                min: min.into(),
-                max: max.into(),
-                bytes,
-            });
+            bounds.push(RowGroupBounds { min, max, bytes });
         }
         let stream = builder.with_batch_size(8192).build()?;
         Ok(RowGroupOpen::Eligible(Self {
@@ -246,16 +242,16 @@ pub(super) struct Runs {
     bytes: usize,
     paths: Vec<ObjPath>,
     ordering: Vec<(String, bool)>,
-    report: Layout,
+    report: Table,
 }
 
 impl Runs {
     #[cfg(test)]
     pub(super) fn new() -> Self {
-        Self::for_report(crate::test_support::layout())
+        Self::for_report(crate::test_support::table())
     }
 
-    pub(super) fn for_report(report: Layout) -> Self {
+    pub(super) fn for_report(report: Table) -> Self {
         Self {
             batches: Vec::new(),
             bytes: 0,
@@ -276,7 +272,7 @@ impl Runs {
             .report
             .dedup_timestamp
             .clone()
-            .expect("test layout has a dedup timestamp");
+            .expect("test table has a dedup timestamp");
         runs.set_unique(unique, &timestamp);
         runs
     }
@@ -306,11 +302,11 @@ impl Runs {
         let batch = concat_batches(&self.batches[0].schema(), &self.batches)?;
         let sorted = sort_batch(&batch, &self.ordering)?;
         let path = work.temp_path();
-        eprintln!(
+        (self.report.cfg.log)(&format!(
             "repack: writing sorted run {path}: {} rows, {} buffered bytes",
             sorted.num_rows(),
             self.bytes
-        );
+        ));
         let mut writer = AsyncArrowWriter::try_new(
             BufWriter::new(work.store.clone(), path.clone()),
             sorted.schema(),
@@ -343,12 +339,12 @@ impl Runs {
             return Ok(None);
         }
         let stream = self.stream(work).await?;
-        eprintln!(
+        (self.report.cfg.log)(&format!(
             "repack: writing final output from {} runs; row-group column={:?}; single-value-groups={node_only}; temporary prefix={}",
             self.paths.len(),
             self.report.row_group_col.as_deref(),
             work.tmp
-        );
+        ));
         let file = write_output(
             work,
             stream,
@@ -422,11 +418,11 @@ impl Runs {
     async fn stream(&mut self, work: &mut Work) -> Result<SendableRecordBatchStream> {
         self.flush(work).await?;
         while self.paths.len() > MERGE_FAN_IN {
-            eprintln!(
+            (self.report.cfg.log)(&format!(
                 "repack: merging {} runs with fan-in {MERGE_FAN_IN} under {}",
                 self.paths.len(),
                 work.tmp
-            );
+            ));
             let mut next = Vec::new();
             for chunk in self.paths.chunks(MERGE_FAN_IN) {
                 let mut stream = merged(work.store.clone(), chunk, &self.ordering).await?;
@@ -1081,17 +1077,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_layout_controls_sorting_and_optional_grouping() {
-        use crate::test_support::layout;
-        let grouped = Layout {
+    async fn report_table_controls_sorting_and_optional_grouping() {
+        use crate::test_support::table;
+        let grouped = Table {
             row_group_col: Some("region".into()),
             sort_cols: vec!["region".into(), "utcbegin".into()],
-            ..layout()
+            ..table()
         };
-        let ungrouped = Layout {
+        let ungrouped = Table {
             row_group_col: None,
             sort_cols: vec!["utcbegin".into(), "region".into()],
-            ..layout()
+            ..table()
         };
         for (report, expected_times, expected_groups) in [
             (grouped, vec![2, 4, 1, 3], 2),

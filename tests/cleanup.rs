@@ -60,6 +60,7 @@ async fn expired_file_cleanup_memory_and_local() {
         let cfg = Config {
             postgres: postgres.clone(),
             storage,
+            log: Arc::new(|message| eprintln!("{message}")),
             repack_run_bytes: DEFAULT_REPACK_RUN_BYTES,
             repack_node_bytes: DEFAULT_REPACK_NODE_BYTES,
         };

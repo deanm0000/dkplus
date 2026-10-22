@@ -20,12 +20,11 @@ const SNAPSHOT_FIELD: &str = "2147483539";
 const FAST_READ_CONCURRENCY: usize = 8;
 const FAST_PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
 
-fn progress(log: &mut Vec<String>, message: String) {
-    eprintln!("repack: {message}");
-    log.push(message);
+fn progress(log: &Log, message: String) {
+    log(&format!("repack: {message}"));
 }
 
-fn fast_progress(log: &mut Vec<String>, job: &Job, message: String) {
+fn fast_progress(log: &Log, job: &Job, message: String) {
     progress(
         log,
         format!(
@@ -36,7 +35,7 @@ fn fast_progress(log: &mut Vec<String>, job: &Job, message: String) {
 }
 
 async fn fast_wait<T: Send>(
-    log: &mut Vec<String>,
+    log: &Log,
     job: &Job,
     phase: &str,
     future: impl std::future::Future<Output = T> + Send,
@@ -78,9 +77,11 @@ impl ExpireSnapshot {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
-    #[serde(skip)]
-    pub layout: Layout,
-    pub table: String,
+    #[serde(
+        serialize_with = "serialize_table",
+        deserialize_with = "deserialize_table"
+    )]
+    pub table: Table,
     pub begin_date: NaiveDate,
     pub end_date: NaiveDate,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,13 +93,78 @@ pub struct Job {
     pub expire_snapshot: ExpireSnapshot,
 }
 
+fn serialize_table<S: serde::Serializer>(
+    table: &Table,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&table.to_string())
+}
+
+fn deserialize_table<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Table, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    let (schema, table) = name.split_once('.').unwrap_or(("main", &name));
+    Ok(Table {
+        schema: schema.into(),
+        table: table.into(),
+        // Queued jobs must be supplied a resolved table before running.
+        time_column: String::new(),
+        ..Table::default()
+    })
+}
+
+impl Table {
+    /// Build a job using table deduplication policy, no file guard, and `IfNoDedup`.
+    pub fn repack(&self, begin_date: NaiveDate, end_date: NaiveDate) -> Job {
+        Job {
+            table: self.clone(),
+            begin_date,
+            end_date,
+            unique: None,
+            files: None,
+            expire_snapshot: ExpireSnapshot::IfNoDedup,
+        }
+    }
+
+    /// Validate and repack immediately with the default job options.
+    pub async fn repack_now(&self, begin_date: NaiveDate, end_date: NaiveDate) -> Result<()> {
+        self.repack(begin_date, end_date).run().await
+    }
+}
+
 impl Job {
-    fn report(&self) -> &Layout {
-        &self.layout
+    pub fn with_unique(mut self, columns: Vec<String>) -> Self {
+        self.unique = Some(columns);
+        self
+    }
+
+    pub fn with_files(mut self, files: Vec<String>) -> Self {
+        self.files = Some(files);
+        self
+    }
+
+    pub fn with_expire_snapshot(mut self, policy: ExpireSnapshot) -> Self {
+        self.expire_snapshot = policy;
+        self
+    }
+
+    /// Validate and execute this job using the table's configuration and logger.
+    pub async fn run(&self) -> Result<()> {
+        run(self).await
+    }
+
+    fn report(&self) -> &Table {
+        &self.table
     }
 
     pub fn validate(&self) -> Result<()> {
-        self.layout.validate()?;
+        self.table.validate()?;
+        if [&self.table.schema, &self.table.table].iter().any(|part| {
+            part.is_empty() || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        }) {
+            bail!("table components must use letters, digits and underscores");
+        }
         if let Some(unique) = &self.unique {
             if unique.is_empty() {
                 bail!("unique must contain at least one column");
@@ -110,26 +176,7 @@ impl Job {
                 }
             }
         }
-        let parts: Vec<_> = self.table.split('.').collect();
-        if parts.len() > 2
-            || parts
-                .iter()
-                .any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
-        {
-            bail!(
-                "table must be a table name or schema.table using letters, digits and underscores"
-            );
-        }
-        let (schema, table) = self.names();
-        if schema != self.layout.schema || table != self.layout.table {
-            bail!(
-                "job table {} does not match resolved layout {}.{}",
-                self.table,
-                self.layout.schema,
-                self.layout.table
-            );
-        }
-        if self.effective_unique().is_some() && self.layout.dedup_timestamp.is_none() {
+        if self.effective_unique().is_some() && self.table.dedup_timestamp.is_none() {
             bail!("deduplication requires a dedup timestamp column");
         }
         if self.begin_date >= self.end_date {
@@ -153,7 +200,7 @@ impl Job {
             if !matches!(
                 schema
                     .field_with_name(
-                        self.layout
+                        self.table
                             .dedup_timestamp
                             .as_deref()
                             .context("deduplication requires a dedup timestamp column")?,
@@ -163,7 +210,7 @@ impl Job {
             ) {
                 bail!(
                     "deduplication requires a microsecond timestamp column {:?}",
-                    self.layout.dedup_timestamp
+                    self.table.dedup_timestamp
                 );
             }
         }
@@ -171,21 +218,19 @@ impl Job {
     }
 
     fn effective_unique(&self) -> Option<&Vec<String>> {
-        self.unique.as_ref().or(self.layout.unique_by_cols.as_ref())
+        self.unique.as_ref().or(self.table.unique_by_cols.as_ref())
     }
 
     fn names(&self) -> (&str, &str) {
-        self.table
-            .split_once('.')
-            .unwrap_or((&self.layout.schema, &self.table))
+        (&self.table.schema, &self.table.table)
     }
 
     fn start(&self) -> Result<DateTime<Utc>> {
-        self.layout.midnight(self.begin_date)
+        self.table.midnight(self.begin_date)
     }
 
     fn end(&self) -> Result<DateTime<Utc>> {
-        self.layout.midnight(self.end_date)
+        self.table.midnight(self.end_date)
     }
 
     fn node_only(&self) -> bool {
@@ -254,7 +299,7 @@ impl Work {
         Ok(())
     }
 
-    async fn cleanup(&mut self, log: &mut Vec<String>) {
+    async fn cleanup(&mut self, log: &Log) {
         for path in self.temps.iter().chain(&self.outputs) {
             if let Err(e) = self.store.delete(path).await {
                 progress(log, format!("could not clean up {path}: {e}"));
@@ -301,8 +346,8 @@ async fn sources(
           WHERE f.table_id = $1 AND f.end_snapshot IS NULL
             AND (s.min_value IS NULL OR s.max_value IS NULL OR s.null_count > 0
                  OR (s.min_value::{ty} < $4::text::{ty} AND s.max_value::{ty} >= $3::text::{ty}))
-          ORDER BY f.data_file_id", ty = job.layout.time_type.sql()),
-        &[&table_id, &utc_col, &job.layout.bound(job.start()?), &job.layout.bound(job.end()?)]
+          ORDER BY f.data_file_id", ty = job.table.time_type.sql()),
+        &[&table_id, &utc_col, &job.table.bound(job.start()?), &job.table.bound(job.end()?)]
     ).await.context("reading repack source files")?;
     let mut out = Vec::new();
     for r in rows {
@@ -444,11 +489,11 @@ fn normalize(
 }
 
 fn split(batch: &RecordBatch, job: &Job) -> Result<[RecordBatch; 3]> {
-    let column = batch.column(batch.schema().index_of(&job.layout.time_column)?);
+    let column = batch.column(batch.schema().index_of(&job.table.time_column)?);
     if column.null_count() != 0 {
         bail!("window column contains nulls; cannot safely repack");
     }
-    let (times, start, end) = match job.layout.time_type {
+    let (times, start, end) = match job.table.time_type {
         TimeType::TimestampTz | TimeType::Timestamp => (
             column
                 .as_primitive::<TimestampMicrosecondType>()
@@ -819,15 +864,15 @@ fn loaded_bytes(cursors: &[FastCursor]) -> usize {
 }
 
 async fn try_aligned(
-    cfg: &Config,
     meta: &TableMeta,
     sources: &[Source],
     job: &Job,
     work: &mut Work,
     target: &SchemaRef,
     cols: &[&Column],
-    log: &mut Vec<String>,
+    log: &Log,
 ) -> Result<Option<(Vec<FileInfo>, i64, i64)>> {
+    let cfg = &job.table.cfg;
     fast_progress(
         log,
         job,
@@ -959,7 +1004,7 @@ async fn align_cursors(
     target: &SchemaRef,
     cols: &[&Column],
     row_group_col: &str,
-    log: &mut Vec<String>,
+    log: &Log,
 ) -> Result<Option<(Vec<FileInfo>, i64, i64)>> {
     let started = std::time::Instant::now();
     let mut writers: [Option<crate::parquet::OutputWriter>; 3] = std::array::from_fn(|_| None);
@@ -1103,7 +1148,7 @@ async fn align_cursors(
                         cursors[cursor_index].source.id, candidate
                     ));
                 }
-                if !next.is_some_and(|bounds| bounds.min == candidate) {
+                if next.is_none_or(|bounds| bounds.min != candidate) {
                     break;
                 }
             }
@@ -1128,7 +1173,7 @@ async fn align_cursors(
             let (deduplicated, count) = sort::deduplicate_batch(
                 &regions[1],
                 unique,
-                job.layout
+                job.table
                     .dedup_timestamp
                     .as_deref()
                     .context("deduplication requires a dedup timestamp column")?,
@@ -1195,7 +1240,7 @@ async fn align_cursors(
         }
         nodes_written += 1;
         if nodes_written == 1
-            || nodes_written % 5000 == 0
+            || nodes_written.is_multiple_of(5000)
             || last_progress.elapsed() >= FAST_PROGRESS_INTERVAL
         {
             fast_progress(
@@ -1270,15 +1315,13 @@ async fn prepare(
     sources: &[Source],
     job: &Job,
     work: &mut Work,
-    log: &mut Vec<String>,
+    log: &Log,
 ) -> Result<Vec<FileInfo>> {
     let data_schema = schema(meta)?;
     job.validate_schema(&data_schema)?;
     let target = with_identity(&data_schema);
     let cols = resolve_columns(meta, &data_schema)?;
-    if let Some((files, _, _)) =
-        try_aligned(cfg, meta, sources, job, work, &target, &cols, log).await?
-    {
+    if let Some((files, _, _)) = try_aligned(meta, sources, job, work, &target, &cols, log).await? {
         return Ok(files);
     }
     if !work.outputs.is_empty() {
@@ -1288,7 +1331,7 @@ async fn prepare(
     if let Some(unique) = job.effective_unique() {
         runs[1].set_unique(
             unique,
-            job.layout
+            job.table
                 .dedup_timestamp
                 .as_deref()
                 .context("deduplication requires a dedup timestamp column")?,
@@ -1398,7 +1441,7 @@ async fn lock_range(client: &Client, job: &Job) -> Result<()> {
         .end()?
         .checked_sub_signed(chrono::Duration::microseconds(1))
         .context("lock range underflow")?;
-    let (mut date, last) = if job.layout.time_type == TimeType::TimestampTz {
+    let (mut date, last) = if job.table.time_type == TimeType::TimestampTz {
         (
             job.start()?.with_timezone(&chrono_tz::UTC).date_naive(),
             last_instant.with_timezone(&chrono_tz::UTC).date_naive(),
@@ -1407,7 +1450,7 @@ async fn lock_range(client: &Client, job: &Job) -> Result<()> {
         (job.begin_date, last_instant.date_naive())
     };
     while date <= last {
-        let key = format!("{}:{schema}.{table}:{date}", job.layout.lock_namespace);
+        let key = format!("{}:{schema}.{table}:{date}", job.table.lock_namespace);
         client
             .query_one(&statement, &[&key])
             .await
@@ -1438,7 +1481,7 @@ async fn has_current_files(c: &impl GenericClient, table_id: i64, job: &Job) -> 
 }
 
 async fn check_inlined(c: &impl GenericClient, table_id: i64, job: &Job) -> Result<()> {
-    if has_inlined_rows(c, table_id, &job.layout, job.start()?, job.end()?).await? {
+    if has_inlined_rows(c, table_id, &job.table, job.start()?, job.end()?).await? {
         bail!("range contains inlined data; flush it to Parquet before repacking");
     }
     Ok(())
@@ -1514,10 +1557,10 @@ async fn commit(
             } else {
                 format!("compacted_table:{}", meta.table_id)
             },
-            &job.layout.author_for("repacker", job.start()?, job.end()?),
+            &job.table.author_for("repacker", job.start()?, job.end()?),
             &format!(
                 "repack {} [{}, {}) {}",
-                job.table, job.begin_date, job.end_date, job.layout.timezone
+                job.table, job.begin_date, job.end_date, job.table.timezone
             ),
         ],
     )
@@ -1600,7 +1643,9 @@ async fn commit(
     Ok(snapshot_id)
 }
 
-pub async fn run(cfg: &Config, job: &Job, log: &mut Vec<String>) -> Result<()> {
+async fn run(job: &Job) -> Result<()> {
+    let cfg = &job.table.cfg;
+    let log = &cfg.log;
     job.validate()?;
     if cfg.repack_run_bytes == 0 || cfg.repack_node_bytes == 0 {
         bail!("repack memory budgets must be positive");
@@ -1620,7 +1665,7 @@ pub async fn run(cfg: &Config, job: &Job, log: &mut Vec<String>) -> Result<()> {
         log,
         format!(
             "waiting for repack advisory locks on {} [{}, {}) {}",
-            job.table, job.begin_date, job.end_date, job.layout.timezone
+            job.table, job.begin_date, job.end_date, job.table.timezone
         ),
     );
     lock_range(&client, job).await?;
@@ -1628,7 +1673,7 @@ pub async fn run(cfg: &Config, job: &Job, log: &mut Vec<String>) -> Result<()> {
         log,
         format!(
             "acquired repack advisory locks on {} [{}, {}) {}",
-            job.table, job.begin_date, job.end_date, job.layout.timezone
+            job.table, job.begin_date, job.end_date, job.table.timezone
         ),
     );
     let (schema_name, table_name) = job.names();
@@ -1649,13 +1694,13 @@ pub async fn run(cfg: &Config, job: &Job, log: &mut Vec<String>) -> Result<()> {
     }
     let utc_col = meta
         .columns
-        .get(&job.layout.time_column)
+        .get(&job.table.time_column)
         .context("table has no configured window column")?
         .id;
-    if types::arrow_type(&meta.columns[&job.layout.time_column].ty)?
-        != types::arrow_type(job.layout.time_type.sql())?
+    if types::arrow_type(&meta.columns[&job.table.time_column].ty)?
+        != types::arrow_type(job.table.time_type.sql())?
     {
-        bail!("window column type does not match layout");
+        bail!("window column type does not match table");
     }
     job.validate_schema(&schema(&meta)?)?;
     progress(
@@ -1744,9 +1789,9 @@ mod tests {
             let mut job = test_job(None);
             job.begin_date = "2026-01-02".parse().unwrap();
             job.end_date = "2026-01-03".parse().unwrap();
-            job.layout.time_type = kind;
-            job.layout.timezone = chrono_tz::UTC;
-            job.layout.time_column = "observed".into();
+            job.table.time_type = kind;
+            job.table.timezone = chrono_tz::UTC;
+            job.table.time_column = "observed".into();
             let column: ArrayRef = if kind == TimeType::Date {
                 Arc::new(Date32Array::from(vec![20454, 20455, 20456]))
             } else {
@@ -1919,14 +1964,65 @@ mod tests {
 
     fn test_job(unique: Option<Vec<String>>) -> Job {
         Job {
-            table: "rtprices".into(),
+            table: crate::test_support::table(),
             begin_date: "2026-01-01".parse().unwrap(),
             end_date: "2026-02-01".parse().unwrap(),
             unique,
             files: None,
             expire_snapshot: ExpireSnapshot::Never,
-            layout: crate::test_support::layout(),
         }
+    }
+
+    #[tokio::test]
+    async fn table_repack_builder_inherits_policy_and_run_validates() {
+        let (log, messages) = crate::test_support::captured_log();
+        let mut table = crate::test_support::table();
+        table.cfg.log = log.clone();
+        table.unique_by_cols = Some(vec!["node".into(), "utcbegin".into()]);
+        let begin = "2026-01-01".parse().unwrap();
+        let end = "2026-02-01".parse().unwrap();
+        let job = table.repack(begin, end);
+        assert_eq!(job.effective_unique(), table.unique_by_cols.as_ref());
+        assert_eq!(job.files, None);
+        assert_eq!(job.expire_snapshot, ExpireSnapshot::IfNoDedup);
+        assert!(Arc::ptr_eq(&job.table.cfg.log, &log));
+        let job = job
+            .with_unique(vec!["node".into()])
+            .with_files(vec!["old.parquet".into()])
+            .with_expire_snapshot(ExpireSnapshot::Never);
+        assert_eq!(job.effective_unique(), Some(&vec!["node".to_string()]));
+        assert_eq!(job.files, Some(vec!["old.parquet".into()]));
+        assert_eq!(job.expire_snapshot, ExpireSnapshot::Never);
+        assert!(
+            table
+                .repack_now(end, begin)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("begin_date")
+        );
+        assert!(
+            table
+                .repack(begin, end)
+                .with_unique(vec![])
+                .run()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unique")
+        );
+        assert!(messages.lock().unwrap().is_empty());
+        table.unique_by_cols = None;
+        assert_eq!(table.repack(begin, end).effective_unique(), None);
+
+        let encoded = serde_json::to_value(&job).unwrap();
+        assert_eq!(encoded["table"], "ciso.rtprices");
+        assert!(encoded.get("cfg").is_none());
+        assert!(encoded.get("layout").is_none());
+        let mut queued: Job = serde_json::from_value(encoded).unwrap();
+        assert!(queued.run().await.is_err());
+        queued.table = table;
+        queued.validate().unwrap();
     }
 
     async fn write_row_groups(
@@ -2244,17 +2340,19 @@ mod tests {
     #[tokio::test]
     async fn fastpack_wait_logs_identify_the_job_and_phase() {
         let job = test_job(None);
-        let mut log = Vec::new();
+        let (log, messages) = crate::test_support::captured_log();
         fast_wait(
-            &mut log,
+            &log,
             &job,
             "opening metadata: 0/24 sources",
             tokio::time::sleep(FAST_PROGRESS_INTERVAL + Duration::from_secs(1)),
         )
         .await;
-        assert!(log.iter().any(|message| message.contains(
+        assert!(messages.lock().unwrap().iter().any(|message| {
+            message.contains(
             "rtprices [2026-01-01, 2026-02-01) fastpack: opening metadata: 0/24 sources; waiting"
-        )));
+        )
+        }));
     }
 
     #[tokio::test]
@@ -2302,26 +2400,27 @@ mod tests {
             crate::config::DEFAULT_REPACK_RUN_BYTES,
             crate::config::DEFAULT_REPACK_NODE_BYTES,
         );
-        let mut log = Vec::new();
+        let (log, messages) = crate::test_support::captured_log();
         let (files, live_rows, removed) =
-            align_cursors(cursors, &job, &mut work, &target, &cols, "node", &mut log)
+            align_cursors(cursors, &job, &mut work, &target, &cols, "node", &log)
                 .await
                 .unwrap()
                 .unwrap();
         assert!(
-            log.iter()
+            messages
+                .lock()
+                .unwrap()
+                .iter()
                 .any(|message| message.contains("fastpack completed successfully"))
         );
-        assert!(
-            log.iter()
-                .all(|message| message.starts_with("rtprices [2026-01-01, 2026-02-01) fastpack:"))
-        );
-        assert!(
-            log.iter()
-                .any(|message| message.contains("progress: 1 nodes written")
-                    && message.contains("row groups read")
-                    && message.contains("buffered="))
-        );
+        assert!(messages.lock().unwrap().iter().all(|message| {
+            message.starts_with("repack: ciso.rtprices [2026-01-01, 2026-02-01) fastpack:")
+        }));
+        assert!(messages.lock().unwrap().iter().any(|message| {
+            message.contains("progress: 1 nodes written")
+                && message.contains("row groups read")
+                && message.contains("buffered=")
+        }));
         assert_eq!((live_rows, removed), (9, 0));
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].rows, 9);
@@ -2413,7 +2512,7 @@ mod tests {
             &target,
             &cols,
             "node",
-            &mut Vec::new(),
+            &job.table.cfg.log,
         )
         .await
         .unwrap()
@@ -2478,29 +2577,27 @@ mod tests {
         )
         .await;
         let mut work = Work::with_limits(store.clone(), "table/".into(), 1, 1024);
-        let mut log = Vec::new();
+        let (log, messages) = crate::test_support::captured_log();
         assert!(
-            align_cursors(
-                vec![cursor],
-                &job,
-                &mut work,
-                &target,
-                &cols,
-                "node",
-                &mut log
-            )
-            .await
-            .unwrap()
-            .is_none()
+            align_cursors(vec![cursor], &job, &mut work, &target, &cols, "node", &log)
+                .await
+                .unwrap()
+                .is_none()
         );
         assert!(work.outputs.is_empty());
         assert!(work.temps.is_empty());
         assert!(
-            log.iter()
+            messages
+                .lock()
+                .unwrap()
+                .iter()
                 .any(|message| message.contains("source 1 row group 0"))
         );
         assert!(
-            log.iter()
+            messages
+                .lock()
+                .unwrap()
+                .iter()
                 .any(|message| message.contains("falling back to external sort"))
         );
 
@@ -2512,23 +2609,21 @@ mod tests {
         .await;
         let mut work = Work::with_limits(Arc::new(InMemory::new()), "table/".into(), 1, 1024);
         work.node_bytes = 1;
-        let mut log = Vec::new();
+        let (log, messages) = crate::test_support::captured_log();
         assert!(
-            align_cursors(
-                vec![cursor],
-                &job,
-                &mut work,
-                &target,
-                &cols,
-                "node",
-                &mut log
-            )
-            .await
-            .unwrap()
-            .is_none()
+            align_cursors(vec![cursor], &job, &mut work, &target, &cols, "node", &log)
+                .await
+                .unwrap()
+                .is_none()
         );
         assert!(work.outputs.is_empty());
-        assert!(log.iter().any(|message| message.contains("node budget")));
+        assert!(
+            messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| message.contains("node budget"))
+        );
     }
 
     #[tokio::test]
@@ -2540,9 +2635,7 @@ mod tests {
         let cols = resolve_columns(&meta, &data_schema).unwrap();
         let job = test_job(None);
         let start = job.start().unwrap().timestamp_micros();
-        let large_group = std::iter::repeat(("B", 1))
-            .take(200_000)
-            .collect::<Vec<_>>();
+        let large_group = std::iter::repeat_n(("B", 1), 200_000).collect::<Vec<_>>();
         write_row_groups(
             &store,
             "budget-source.parquet",
@@ -2566,7 +2659,7 @@ mod tests {
                 &target,
                 &cols,
                 "node",
-                &mut Vec::new()
+                &job.table.cfg.log
             )
             .await
             .unwrap()
@@ -2673,7 +2766,7 @@ mod tests {
             &target,
             &cols,
             "node",
-            &mut Vec::new(),
+            &job.table.cfg.log,
         )
         .await
         .unwrap()
@@ -2747,7 +2840,7 @@ mod tests {
             &target,
             &cols,
             "node",
-            &mut Vec::new(),
+            &job.table.cfg.log,
         )
         .await
         .unwrap()
@@ -2790,7 +2883,9 @@ mod tests {
         });
         let default: Job = crate::test_support::job_from_value(base.clone()).unwrap();
         assert_eq!(default.expire_snapshot, ExpireSnapshot::Never);
-        assert_eq!(serde_json::to_value(default).unwrap(), base);
+        let mut canonical = base.clone();
+        canonical["table"] = serde_json::json!("ciso.rtprices");
+        assert_eq!(serde_json::to_value(default).unwrap(), canonical);
         for (policy, encoded, no_dedup, dedup) in [
             (ExpireSnapshot::Always, "always", true, true),
             (ExpireSnapshot::IfNoDedup, "if_no_dedup", true, false),
@@ -2825,7 +2920,9 @@ mod tests {
         let job: Job = crate::test_support::job_from_value(base.clone()).unwrap();
         job.validate().unwrap();
         assert!(job.files.is_none());
-        assert_eq!(serde_json::to_value(job).unwrap(), base);
+        let mut canonical = base.clone();
+        canonical["table"] = serde_json::json!("ciso.rtprices");
+        assert_eq!(serde_json::to_value(job).unwrap(), canonical);
         for files in [
             serde_json::Value::Null,
             serde_json::json!([]),
@@ -2867,11 +2964,11 @@ mod tests {
         let mut first = test_job(None);
         first.begin_date = "2026-01-01".parse().unwrap();
         first.end_date = "2026-01-02".parse().unwrap();
-        first.layout.timezone = chrono_tz::UTC;
+        first.table.timezone = chrono_tz::UTC;
         let mut second = first.clone();
         second.begin_date = "2026-01-02".parse().unwrap();
         second.end_date = "2026-01-03".parse().unwrap();
-        second.layout.timezone = chrono_tz::Asia::Tokyo;
+        second.table.timezone = chrono_tz::Asia::Tokyo;
         lock_range(&owner, &first).await.unwrap();
         assert!(
             tokio::time::timeout(
@@ -2896,10 +2993,11 @@ mod tests {
         let (mut owner, owner_connection) = test_database().await;
         let (waiter, waiter_connection) = test_database().await;
         let (other, other_connection) = test_database().await;
-        let job: Job = crate::test_support::job_from_value(serde_json::json!({
+        let mut job: Job = crate::test_support::job_from_value(serde_json::json!({
             "table": "rtprices", "begin_date": "2026-01-01", "end_date": "2026-02-01"
         }))
         .unwrap();
+        job.table.timezone = chrono_tz::UTC;
         lock_range(&owner, &job).await.unwrap();
         let owner_pid: i32 = owner
             .query_one("SELECT pg_backend_pid()", &[])
@@ -2916,10 +3014,11 @@ mod tests {
             &[&owner_pid],
         ).await.unwrap().get(0);
         assert_eq!(held, 31);
-        let alias: Job = crate::test_support::job_from_value(serde_json::json!({
+        let mut alias: Job = crate::test_support::job_from_value(serde_json::json!({
             "table": "ciso.rtprices", "begin_date": "2026-01-15", "end_date": "2026-02-15"
         }))
         .unwrap();
+        alias.table.timezone = chrono_tz::UTC;
         let mut waiting = tokio::spawn(async move {
             lock_range(&waiter, &alias).await.unwrap();
             waiter
@@ -2958,10 +3057,11 @@ mod tests {
             ("ciso.rtprices", "2026-03-07", "2026-03-10", 3),
             ("ciso.rtprices", "2026-10-31", "2026-11-03", 3),
         ] {
-            let other_job: Job = crate::test_support::job_from_value(serde_json::json!({
+            let mut other_job: Job = crate::test_support::job_from_value(serde_json::json!({
                 "table": table, "begin_date": begin, "end_date": end
             }))
             .unwrap();
+            other_job.table.timezone = chrono_tz::UTC;
             timeout(Duration::from_secs(5), lock_range(&other, &other_job))
                 .await
                 .unwrap()
@@ -3123,13 +3223,15 @@ mod tests {
         }
         for table in ["", "a.b.c", "a;DROP", "../rtprices"] {
             let job = Job {
-                table: table.into(),
+                table: Table {
+                    table: table.into(),
+                    ..crate::test_support::table()
+                },
                 begin_date: "2026-01-01".parse().unwrap(),
                 end_date: "2026-02-01".parse().unwrap(),
                 unique: None,
                 files: None,
                 expire_snapshot: ExpireSnapshot::Never,
-                layout: crate::test_support::layout(),
             };
             assert!(job.validate().is_err());
         }
@@ -3179,13 +3281,12 @@ mod tests {
             ),
         ] {
             let job = Job {
-                table: "rtprices".into(),
+                table: crate::test_support::table(),
                 begin_date: begin.parse().unwrap(),
                 end_date: end.parse().unwrap(),
                 unique: None,
                 files: None,
                 expire_snapshot: ExpireSnapshot::Never,
-                layout: crate::test_support::layout(),
             };
             job.validate().unwrap();
             let start = DateTime::parse_from_rfc3339(expected_start)
@@ -3224,13 +3325,12 @@ mod tests {
             );
         }
         let job = Job {
-            table: "rtprices".into(),
+            table: crate::test_support::table(),
             begin_date: "2026-03-01".parse().unwrap(),
             end_date: "2026-04-01".parse().unwrap(),
             unique: None,
             files: None,
             expire_snapshot: ExpireSnapshot::Never,
-            layout: crate::test_support::layout(),
         };
         assert!(job.node_only());
         assert_eq!(

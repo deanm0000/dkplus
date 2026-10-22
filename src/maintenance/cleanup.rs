@@ -87,6 +87,7 @@ pub async fn cleanup_expired_files(
         identifier(schema)?;
         identifier(table)?;
     }
+    (cfg.log)("checking expired files for cleanup");
     let mut client = connect(cfg).await?;
     let tx = client.transaction().await?;
     // Retain metadata locks through physical deletion to prevent concurrent
@@ -250,6 +251,13 @@ pub async fn cleanup_expired_files(
     tx.commit()
         .await
         .context("committing expired-file cleanup")?;
+    (cfg.log)(&format!(
+        "expired-file cleanup: {} candidates, {} deleted, {} already missing; dry-run={}",
+        report.files.len(),
+        report.deleted,
+        report.already_missing,
+        options.dry_run
+    ));
     Ok(report)
 }
 

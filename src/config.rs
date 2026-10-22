@@ -104,6 +104,19 @@ pub struct Config {
     pub storage: Storage,
     pub repack_run_bytes: usize,
     pub repack_node_bytes: usize,
+    /// Receives progress and background errors from all operations.
+    pub log: Log,
+}
+
+pub type Log = Arc<dyn Fn(&str) + Send + Sync>;
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("repack_run_bytes", &self.repack_run_bytes)
+            .field("repack_node_bytes", &self.repack_node_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,9 +136,10 @@ impl TimeType {
     }
 }
 
-/// Resolved policy for one DuckLake table. Create it with [`Layout::builder`].
+/// Resolved policy for one DuckLake table. Create it with [`Table::builder`].
 #[derive(Debug, Clone)]
-pub struct Layout {
+pub struct Table {
+    pub cfg: Config,
     pub schema: String,
     pub table: String,
     pub time_column: String,
@@ -139,11 +153,21 @@ pub struct Layout {
     pub lock_namespace: String,
 }
 
-/// Placeholder used by deserialized repack jobs until the caller supplies a
-/// resolved per-table layout. Use [`Layout::builder`] for valid layouts.
-impl Default for Layout {
+/// Unconfigured placeholder for queued jobs. Resolve a [`Table::builder`] before
+/// running operations.
+impl Default for Table {
     fn default() -> Self {
         Self {
+            cfg: Config {
+                postgres: tokio_postgres::Config::new(),
+                storage: Storage::Store {
+                    root: String::new(),
+                    store: Arc::new(object_store::memory::InMemory::new()),
+                },
+                repack_run_bytes: DEFAULT_REPACK_RUN_BYTES,
+                repack_node_bytes: DEFAULT_REPACK_NODE_BYTES,
+                log: Arc::new(|message| eprintln!("{message}")),
+            },
             schema: "main".into(),
             table: String::new(),
             time_column: "time".into(),
@@ -159,9 +183,15 @@ impl Default for Layout {
     }
 }
 
+impl std::fmt::Display for Table {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.schema, self.table)
+    }
+}
+
 /// Builder for resolving table policy from explicit values and DuckLake tags.
 #[derive(Debug, Clone)]
-pub struct LayoutBuilder {
+pub struct TableBuilder {
     pub(crate) schema: String,
     pub(crate) table: String,
     pub(crate) time_column: Option<String>,
@@ -174,13 +204,13 @@ pub struct LayoutBuilder {
     pub(crate) lock_namespace: Option<String>,
 }
 
-impl Layout {
-    pub fn builder(schema: impl Into<String>, table: impl Into<String>) -> LayoutBuilder {
-        LayoutBuilder::new(schema, table)
+impl Table {
+    pub fn builder(schema: impl Into<String>, table: impl Into<String>) -> TableBuilder {
+        TableBuilder::new(schema, table)
     }
 }
 
-impl LayoutBuilder {
+impl TableBuilder {
     pub fn new(schema: impl Into<String>, table: impl Into<String>) -> Self {
         Self {
             schema: schema.into(),
@@ -247,12 +277,12 @@ impl LayoutBuilder {
         self
     }
 
-    pub async fn resolve(self, cfg: &Config) -> Result<Layout> {
-        crate::resolve_layout(cfg, self).await
+    pub async fn resolve(self, cfg: &Config) -> Result<Table> {
+        crate::resolve_table(cfg, self).await
     }
 }
 
-impl Layout {
+impl Table {
     pub fn validate(&self) -> Result<()> {
         identifier(&self.schema)?;
         identifier(&self.table)?;
@@ -332,41 +362,6 @@ impl Layout {
     }
 }
 
-/// Typed bounds for replacement loads. Repack uses calendar dates plus Layout.
-#[derive(Debug, Clone)]
-pub enum Window {
-    TimestampTz {
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    },
-    Timestamp {
-        start: chrono::NaiveDateTime,
-        end: chrono::NaiveDateTime,
-    },
-    Date {
-        start: NaiveDate,
-        end: NaiveDate,
-    },
-}
-
-impl Window {
-    pub(crate) fn bounds(&self, layout: &Layout) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-        let (kind, start, end) = match self {
-            Self::TimestampTz { start, end } => (TimeType::TimestampTz, *start, *end),
-            Self::Timestamp { start, end } => (TimeType::Timestamp, start.and_utc(), end.and_utc()),
-            Self::Date { start, end } => (
-                TimeType::Date,
-                layout.midnight(*start)?,
-                layout.midnight(*end)?,
-            ),
-        };
-        if kind != layout.time_type || start >= end {
-            bail!("window type must match the layout and start must precede end");
-        }
-        Ok((start, end))
-    }
-}
-
 pub(crate) fn identifier(name: &str) -> Result<String> {
     if name.is_empty() || name.contains('\0') {
         bail!("SQL identifier must be nonempty and contain no NUL");
@@ -379,35 +374,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn typed_windows_and_dst_have_explicit_domains() {
+    fn midnight_domains_preserve_dst_and_wall_clock_dates() {
         let start = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
         let end = start.succ_opt().unwrap();
-        let mut layout = Layout {
+        let mut table = Table {
             table: "records".into(),
             timezone: chrono_tz::America::Los_Angeles,
-            ..Layout::default()
+            ..Table::default()
         };
-        let a = layout.midnight(start).unwrap();
-        let b = layout.midnight(end).unwrap();
+        let a = table.midnight(start).unwrap();
+        let b = table.midnight(end).unwrap();
         assert_eq!((b - a).num_hours(), 23);
-        assert!(Window::Date { start, end }.bounds(&layout).is_err());
-        layout.time_type = TimeType::Timestamp;
-        let (a, b) = Window::Timestamp {
-            start: start.and_hms_opt(0, 0, 0).unwrap(),
-            end: end.and_hms_opt(0, 0, 0).unwrap(),
-        }
-        .bounds(&layout)
-        .unwrap();
+        table.time_type = TimeType::Timestamp;
+        let (a, b) = (table.midnight(start).unwrap(), table.midnight(end).unwrap());
         assert_eq!((b - a).num_hours(), 24);
-        layout.time_type = TimeType::Date;
-        assert!(Window::Date { start, end }.bounds(&layout).is_ok());
-        assert!(
-            Window::Date {
-                start: end,
-                end: start
-            }
-            .bounds(&layout)
-            .is_err()
+        table.time_type = TimeType::Date;
+        assert_eq!(
+            (table.midnight(end).unwrap() - table.midnight(start).unwrap()).num_days(),
+            1
         );
     }
 
