@@ -888,52 +888,56 @@ fn loaded_bytes(cursors: &[FastCursor]) -> usize {
         })
 }
 
+struct AlignmentContext<'a> {
+    job: &'a Job,
+    window: Window,
+    discard_inside: bool,
+    work: &'a mut Work,
+    target: &'a SchemaRef,
+    cols: &'a [&'a Column],
+    log: &'a Log,
+}
+
 async fn try_aligned(
     meta: &TableMeta,
     sources: &[Source],
-    job: &Job,
-    window: Window,
-    discard_inside: bool,
-    work: &mut Work,
-    target: &SchemaRef,
-    cols: &[&Column],
-    log: &Log,
+    context: AlignmentContext<'_>,
 ) -> Result<Option<(Vec<FileInfo>, i64, i64)>> {
-    let cfg = &job.table.cfg;
+    let cfg = &context.job.table.cfg;
     fast_progress(
-        log,
-        job,
+        context.log,
+        context.job,
         format!(
             "attempting aligned fastpack for {} sources using row-group column {:?} (node budget={} bytes)",
             sources.len(),
-            job.report().row_group_col.as_deref(),
-            work.node_bytes
+            context.job.report().row_group_col.as_deref(),
+            context.work.node_bytes
         ),
     );
-    let Some(row_group_col) = job.report().row_group_col.as_deref() else {
+    let Some(row_group_col) = context.job.report().row_group_col.as_deref() else {
         fast_progress(
-            log,
-            job,
+            context.log,
+            context.job,
             "unable to fastpack: report has no row-group column".into(),
         );
         return Ok(None);
     };
-    if let Some(unique) = job.effective_unique()
+    if let Some(unique) = context.job.effective_unique()
         && !unique.iter().any(|name| name == row_group_col)
     {
         fast_progress(
-            log,
-            job,
+            context.log,
+            context.job,
             format!(
                 "unable to fastpack: unique columns {unique:?} do not include row-group column {row_group_col:?}"
             ),
         );
         return Ok(None);
     }
-    if job.report().sort_cols.first().map(String::as_str) != Some(row_group_col) {
+    if context.job.report().sort_cols.first().map(String::as_str) != Some(row_group_col) {
         fast_progress(
-            log,
-            job,
+            context.log,
+            context.job,
             format!(
                 "unable to fastpack: row-group column {row_group_col:?} is not the first output sort column"
             ),
@@ -941,8 +945,8 @@ async fn try_aligned(
         return Ok(None);
     }
     fast_progress(
-        log,
-        job,
+        context.log,
+        context.job,
         format!(
             "opening metadata: 0/{} sources; up to {FAST_READ_CONCURRENCY} concurrent reads",
             sources.len()
@@ -982,8 +986,8 @@ async fn try_aligned(
     let mut openings = futures::stream::iter(pending).buffered(FAST_READ_CONCURRENCY);
     let mut cursors = Vec::with_capacity(sources.len());
     while let Some(cursor) = fast_wait(
-        log,
-        job,
+        context.log,
+        context.job,
         &format!(
             "opening metadata: {}/{} sources",
             cursors.len(),
@@ -996,7 +1000,11 @@ async fn try_aligned(
         match cursor {
             Ok(cursor) => cursors.push(cursor),
             Err(reason) => {
-                fast_progress(log, job, format!("unable to fastpack: {reason}"));
+                fast_progress(
+                    context.log,
+                    context.job,
+                    format!("unable to fastpack: {reason}"),
+                );
                 return Ok(None);
             }
         }
@@ -1005,8 +1013,8 @@ async fn try_aligned(
             || last_progress.elapsed() >= FAST_PROGRESS_INTERVAL
         {
             fast_progress(
-                log,
-                job,
+                context.log,
+                context.job,
                 format!(
                     "opened metadata: {}/{} sources, {} row groups in {:.1}s",
                     cursors.len(),
@@ -1021,18 +1029,7 @@ async fn try_aligned(
             last_progress = Instant::now();
         }
     }
-    align_cursors_with_window(
-        cursors,
-        job,
-        window,
-        discard_inside,
-        work,
-        target,
-        cols,
-        row_group_col,
-        log,
-    )
-    .await
+    align_cursors_with_window(cursors, context, row_group_col).await
 }
 
 #[cfg(test)]
@@ -1047,29 +1044,34 @@ async fn align_cursors(
 ) -> Result<Option<(Vec<FileInfo>, i64, i64)>> {
     align_cursors_with_window(
         cursors,
-        job,
-        Window::for_job(job)?,
-        false,
-        work,
-        target,
-        cols,
+        AlignmentContext {
+            job,
+            window: Window::for_job(job)?,
+            discard_inside: false,
+            work,
+            target,
+            cols,
+            log,
+        },
         row_group_col,
-        log,
     )
     .await
 }
 
 async fn align_cursors_with_window(
     mut cursors: Vec<FastCursor>,
-    job: &Job,
-    window: Window,
-    discard_inside: bool,
-    work: &mut Work,
-    target: &SchemaRef,
-    cols: &[&Column],
+    context: AlignmentContext<'_>,
     row_group_col: &str,
-    log: &Log,
 ) -> Result<Option<(Vec<FileInfo>, i64, i64)>> {
+    let AlignmentContext {
+        job,
+        window,
+        discard_inside,
+        work,
+        target,
+        cols,
+        log,
+    } = context;
     let started = std::time::Instant::now();
     let mut writers: [Option<crate::parquet::OutputWriter>; 3] = std::array::from_fn(|_| None);
     macro_rules! fallback {
@@ -1383,16 +1385,28 @@ async fn align_cursors_with_window(
     Ok(Some((files, live_rows, removed)))
 }
 
-async fn prepare(
-    cfg: &Config,
-    meta: &TableMeta,
-    sources: &[Source],
-    job: &Job,
+struct PrepareContext<'a> {
+    cfg: &'a Config,
+    meta: &'a TableMeta,
+    sources: &'a [Source],
+    job: &'a Job,
     window: Window,
     discard_inside: bool,
-    work: &mut Work,
-    log: &Log,
-) -> Result<Vec<FileInfo>> {
+    work: &'a mut Work,
+    log: &'a Log,
+}
+
+async fn prepare(context: PrepareContext<'_>) -> Result<Vec<FileInfo>> {
+    let PrepareContext {
+        cfg,
+        meta,
+        sources,
+        job,
+        window,
+        discard_inside,
+        work,
+        log,
+    } = context;
     let data_schema = schema(meta)?;
     job.validate_schema(&data_schema)?;
     let target = with_identity(&data_schema);
@@ -1400,13 +1414,15 @@ async fn prepare(
     if let Some((files, _, _)) = try_aligned(
         meta,
         sources,
-        job,
-        window,
-        discard_inside,
-        work,
-        &target,
-        &cols,
-        log,
+        AlignmentContext {
+            job,
+            window,
+            discard_inside,
+            work: &mut *work,
+            target: &target,
+            cols: &cols,
+            log,
+        },
     )
     .await?
     {
@@ -1632,16 +1648,29 @@ async fn retire_inlined_rows(
     Ok(removed)
 }
 
+struct CommitContext<'a> {
+    meta: &'a TableMeta,
+    utc_col: i64,
+    selected: &'a [Source],
+    job: &'a Job,
+    window: Window,
+    files: &'a [FileInfo],
+    replacement: Option<&'a crate::FileInfo>,
+}
+
 async fn commit(
     client: &mut Client,
-    meta: &TableMeta,
-    utc_col: i64,
-    selected: &[Source],
-    job: &Job,
-    window: Window,
-    files: &[FileInfo],
-    replacement: Option<&crate::FileInfo>,
+    context: CommitContext<'_>,
 ) -> Result<(i64, Option<i64>, i64, i64)> {
+    let CommitContext {
+        meta,
+        utc_col,
+        selected,
+        job,
+        window,
+        files,
+        replacement,
+    } = context;
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
@@ -1943,16 +1972,16 @@ pub(crate) async fn replace_window(
         let files = if selected.is_empty() {
             Vec::new()
         } else {
-            prepare(
-                &table.cfg,
+            prepare(PrepareContext {
+                cfg: &table.cfg,
                 meta,
-                &selected,
-                &job,
+                sources: &selected,
+                job: &job,
                 window,
-                true,
-                &mut work,
-                &table.cfg.log,
-            )
+                discard_inside: true,
+                work: &mut work,
+                log: &table.cfg.log,
+            })
             .await?
         };
         work.outputs.clear();
@@ -1960,13 +1989,15 @@ pub(crate) async fn replace_window(
         let (snapshot_id, incoming_id) = loop {
             match commit(
                 client,
-                meta,
-                utc_col,
-                &selected,
-                &job,
-                window,
-                &files,
-                Some(incoming),
+                CommitContext {
+                    meta,
+                    utc_col,
+                    selected: &selected,
+                    job: &job,
+                    window,
+                    files: &files,
+                    replacement: Some(incoming),
+                },
             )
             .await
             {
@@ -2092,16 +2123,16 @@ async fn run(job: &Job) -> Result<()> {
         ),
     );
     let result = async {
-        let files = prepare(
+        let files = prepare(PrepareContext {
             cfg,
-            &meta,
-            &selected,
+            meta: &meta,
+            sources: &selected,
             job,
             window,
-            false,
-            &mut work,
+            discard_inside: false,
+            work: &mut work,
             log,
-        )
+        })
         .await?;
         // Never delete published files if a lost COMMIT response makes the outcome uncertain.
         work.outputs.clear();
@@ -2110,13 +2141,15 @@ async fn run(job: &Job) -> Result<()> {
             progress(log, format!("publishing {} replacement files (attempt {attempt})", files.len()));
             match commit(
                 &mut client,
-                &meta,
-                utc_col,
-                &selected,
-                job,
-                window,
-                &files,
-                None,
+                CommitContext {
+                    meta: &meta,
+                    utc_col,
+                    selected: &selected,
+                    job,
+                    window,
+                    files: &files,
+                    replacement: None,
+                },
             )
             .await
             {
