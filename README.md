@@ -105,8 +105,10 @@ async fn main() -> anyhow::Result<()> {
 ```
 
 Tables must already exist; dkplus neither creates tables nor migrates schemas.
-`replace_window` keeps the basic initial-load Parquet layout, replacing rows using
-file retirement or pg_ducklake SQL DELETE for straddling/inlined data.
+`replace_window` keeps the basic initial-load Parquet layout. It retires files
+fully covered by the replacement range, rewrites straddling Parquet files to keep
+their out-of-range rows, and versions matching inlined rows out of the new snapshot.
+These operations are implemented directly against DuckLake's catalog and files.
 The replacement window is inferred from the minimum and maximum `time_column`
 values across all input batches. It includes the maximum: the half-open upper
 bound is one microsecond later for timestamps or one day later for dates.
@@ -242,21 +244,21 @@ async fn load(table: &Table) -> anyhow::Result<()> {
 
     let report = table.replace_window(vec![batch]).await?;
     println!(
-        "snapshot {} wrote {} rows to {}; retired {} files ({} rows), sql-deleted {:?}",
+        "snapshot {} wrote {} rows to {}; retired {} files ({} rows), rewrote {} files",
         report.snapshot_id, report.rows, report.path,
-        report.retired_files.len(), report.retired_rows, report.sql_deleted,
+        report.retired_files.len(), report.retired_rows, report.rewritten_files.len(),
     );
     Ok(())
 }
 ```
 
 `LoadReport` fields: `snapshot_id`, `data_file_id`, `path`, `rows`,
-`file_size_bytes`, `retired_files` / `retired_rows` (files wholly inside the
-window, retired via `end_snapshot`) and `sql_deleted` (rows removed by
-pg_ducklake `DELETE` when a file straddles the window). Commit conflicts are
-retried automatically. Use Arrow `Date32` for dates or microsecond timestamps
-(timezone-aware for `timestamptz`, naive for `timestamp`), matching the resolved
-table's time column.
+`file_size_bytes`, `retired_files` / `retired_rows` (source files and their
+record counts retired via `end_snapshot`), and `rewritten_files` (retired source
+files processed by the rewrite path to preserve rows outside the replacement
+window). Commit conflicts are retried automatically. Use Arrow `Date32` for dates
+or microsecond timestamps (timezone-aware for `timestamptz`, naive for `timestamp`),
+matching the resolved table's time column.
 
 ### 3. Maintenance: discover and repack
 

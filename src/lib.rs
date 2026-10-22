@@ -39,11 +39,11 @@ pub struct LoadReport {
     pub path: String,
     pub rows: i64,
     pub file_size_bytes: i64,
-    /// Files fully inside the window that were retired via `end_snapshot`.
+    /// Files retired via `end_snapshot`.
     pub retired_files: Vec<i64>,
     pub retired_rows: i64,
-    /// Rows removed through pg_ducklake `DELETE` (only when a file straddles the window).
-    pub sql_deleted: Option<u64>,
+    /// Retired files rewritten to retain their rows outside the replacement window.
+    pub rewritten_files: Vec<i64>,
 }
 
 #[derive(PartialEq)]
@@ -60,7 +60,7 @@ struct TableMeta {
     columns: HashMap<String, Column>,
 }
 
-struct ColStats {
+pub(crate) struct ColStats {
     column_id: i64,
     ty: String,
     size_bytes: i64,
@@ -71,12 +71,12 @@ struct ColStats {
     contains_nan: Option<bool>,
 }
 
-struct FileInfo {
-    name: String,
-    rows: i64,
-    size: i64,
-    footer: i64,
-    stats: Vec<ColStats>,
+pub(crate) struct FileInfo {
+    pub(crate) name: String,
+    pub(crate) rows: i64,
+    pub(crate) size: i64,
+    pub(crate) footer: i64,
+    pub(crate) stats: Vec<ColStats>,
 }
 
 pub async fn connect(cfg: &Config) -> Result<Client> {
@@ -533,7 +533,7 @@ fn widen(ty: &str, old: Option<String>, new: &Option<String>, want_max: bool) ->
 
 enum Attempt {
     Done(LoadReport),
-    NeedsSqlDelete,
+    NeedsRewrite,
 }
 
 async fn try_register(
@@ -591,12 +591,12 @@ async fn try_register(
                 retired_rows += r.get::<_, Option<i64>>(1).unwrap_or(0);
             }
             // Straddles the window (e.g. after compaction) or has no stats.
-            _ => return Ok(Attempt::NeedsSqlDelete),
+            _ => return Ok(Attempt::NeedsRewrite),
         }
     }
 
     if has_inlined_rows(&tx, table_id, table, start, end).await? {
-        return Ok(Attempt::NeedsSqlDelete);
+        return Ok(Attempt::NeedsRewrite);
     }
 
     let snapshot_id = prev_snap + 1;
@@ -722,11 +722,11 @@ async fn try_register(
         file_size_bytes: file.size,
         retired_files: retire,
         retired_rows,
-        sql_deleted: None,
+        rewritten_files: Vec::new(),
     }))
 }
 
-async fn update_table_stats(
+pub(crate) async fn update_table_stats(
     tx: &impl GenericClient,
     table_id: i64,
     has_row: bool,
@@ -746,7 +746,8 @@ async fn update_table_stats(
         )
         .await
         .context("summing table stats")?;
-    let (record_count, size): (i64, i64) = (totals.get(0), totals.get(1));
+    let inlined_count = inlined_record_count(tx, table_id).await?;
+    let (record_count, size): (i64, i64) = (totals.get::<_, i64>(0) + inlined_count, totals.get(1));
     if has_row {
         tx.execute(
             "UPDATE ducklake.ducklake_table_stats
@@ -762,6 +763,33 @@ async fn update_table_stats(
             &[&table_id, &record_count, &next_row_id, &size],
         )
         .await?;
+    }
+
+    async fn inlined_record_count(tx: &impl GenericClient, table_id: i64) -> Result<i64> {
+        let tables = tx
+            .query(
+                "SELECT table_name FROM ducklake.ducklake_inlined_data_tables WHERE table_id = $1",
+                &[&table_id],
+            )
+            .await
+            .context("reading inlined data tables for statistics")?;
+        let mut count = 0i64;
+        for row in tables {
+            let name: String = row.get(0);
+            let n: i64 = tx
+                .query_one(
+                    &format!(
+                        "SELECT count(*) FROM ducklake.{} WHERE end_snapshot IS NULL",
+                        identifier(&name)?
+                    ),
+                    &[],
+                )
+                .await
+                .with_context(|| format!("counting current inlined rows in {name}"))?
+                .get(0);
+            count += n;
+        }
+        Ok(count)
     }
 
     #[derive(Clone)]
@@ -848,28 +876,6 @@ fn is_commit_conflict(e: &anyhow::Error) -> bool {
         .any(|code| {
             *code == SqlState::UNIQUE_VIOLATION || *code == SqlState::T_R_SERIALIZATION_FAILURE
         })
-}
-
-/// Fallback for windows whose rows share files with other hours: let pg_ducklake delete them.
-async fn sql_delete(
-    client: &Client,
-    table: &Table,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-) -> Result<u64> {
-    let sql = format!(
-        "DELETE FROM {}.{} WHERE {} >= $1::text::{} AND {} < $2::text::{}",
-        identifier(&table.schema)?,
-        identifier(&table.table)?,
-        identifier(&table.time_column)?,
-        table.time_type.sql(),
-        identifier(&table.time_column)?,
-        table.time_type.sql()
-    );
-    client
-        .execute(&sql, &[&table.bound(start), &table.bound(end)])
-        .await
-        .context("pg_ducklake DELETE for window")
 }
 
 impl Table {
@@ -987,18 +993,12 @@ async fn register(
     end: DateTime<Utc>,
     file: &FileInfo,
 ) -> Result<LoadReport> {
-    let mut sql_deleted = None;
     for attempt in 1..=MAX_COMMIT_ATTEMPTS {
         match try_register(client, table, meta, utc_col, start, end, file).await {
-            Ok(Attempt::Done(mut report)) => {
-                report.sql_deleted = sql_deleted;
-                return Ok(report);
-            }
-            Ok(Attempt::NeedsSqlDelete) => {
-                if sql_deleted.is_some() {
-                    bail!("rows for {start} still present after pg_ducklake DELETE");
-                }
-                sql_deleted = Some(sql_delete(client, table, start, end).await?);
+            Ok(Attempt::Done(report)) => return Ok(report),
+            Ok(Attempt::NeedsRewrite) => {
+                let window = repack::Window { start, end };
+                return repack::replace_window(client, meta, utc_col, table, window, file).await;
             }
             Err(e) if is_commit_conflict(&e) && attempt < MAX_COMMIT_ATTEMPTS => {
                 (table.cfg.log)(&format!(
@@ -1246,52 +1246,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("time_column"));
-    }
-
-    #[tokio::test]
-    #[ignore = "requires MAINTENANCE_TEST_DATABASE_URL pointing to isolated test Postgres"]
-    async fn typed_sql_delete_uses_half_open_bounds_and_quoted_identifiers() {
-        let url = std::env::var("MAINTENANCE_TEST_DATABASE_URL").unwrap();
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .unwrap();
-        let connection = tokio::spawn(async move { connection.await.unwrap() });
-        client
-            .batch_execute("SET TIME ZONE 'Pacific/Auckland'")
-            .await
-            .unwrap();
-        for kind in [TimeType::TimestampTz, TimeType::Timestamp, TimeType::Date] {
-            let table = Table {
-                schema: "pg_temp".into(),
-                table: "records".into(),
-                time_column: "event time".into(),
-                time_type: kind,
-                ..Table::default()
-            };
-            client.batch_execute(&format!(
-                "CREATE TEMP TABLE records (\"event time\" {});
-                 INSERT INTO records VALUES ('2026-01-01 00:00:00+00'),('2026-01-02 00:00:00+00'),('2026-01-03 00:00:00+00')",
-                kind.sql(),
-            )).await.unwrap();
-            let start = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc);
-            let end = DateTime::parse_from_rfc3339("2026-01-03T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc);
-            assert_eq!(sql_delete(&client, &table, start, end).await.unwrap(), 1);
-            assert_eq!(
-                client
-                    .query_one("SELECT count(*) FROM records", &[])
-                    .await
-                    .unwrap()
-                    .get::<_, i64>(0),
-                2
-            );
-            client.batch_execute("DROP TABLE records").await.unwrap();
-        }
-        drop(client);
-        connection.await.unwrap();
     }
 
     #[test]

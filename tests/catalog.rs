@@ -211,6 +211,106 @@ async fn inferred_replacement_retires_inclusive_bounds_and_gaps() {
 
 #[tokio::test]
 #[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+async fn replacement_rewrites_straddling_files_and_versions_inlined_rows() {
+    let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    let (_, job, _) = expiry_fixture(&client, &postgres).await;
+    let table = job.table;
+    let batch = |date: &str| {
+        let date: NaiveDate = date.parse().unwrap();
+        let day = date
+            .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+            .num_days();
+        RecordBatch::try_from_iter([
+            (
+                "observed",
+                Arc::new(Date32Array::from(vec![i32::try_from(day).unwrap()])) as ArrayRef,
+            ),
+            ("station", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+            (
+                "fetched",
+                Arc::new(TimestampMicrosecondArray::from(vec![10])) as ArrayRef,
+            ),
+        ])
+        .unwrap()
+    };
+
+    table
+        .replace_window(vec![batch("2026-01-02")])
+        .await
+        .unwrap();
+    table
+        .replace_window(vec![batch("2026-01-03")])
+        .await
+        .unwrap();
+    let begin: NaiveDate = "2026-01-01".parse().unwrap();
+    let end: NaiveDate = "2026-02-01".parse().unwrap();
+    table
+        .repack(begin, end)
+        .with_expire_snapshot(dkplus::repack::ExpireSnapshot::Never)
+        .run()
+        .await
+        .unwrap();
+
+    client
+        .batch_execute(
+            "CREATE TABLE ducklake.inline_observations (observed date, end_snapshot bigint);
+             INSERT INTO ducklake.inline_observations VALUES
+                 ('2026-01-02',NULL), ('2025-12-31',NULL);
+             INSERT INTO ducklake.ducklake_inlined_data_tables VALUES (1,'inline_observations');
+             UPDATE ducklake.ducklake_table_stats SET record_count = record_count + 2
+              WHERE table_id = 1;",
+        )
+        .await
+        .unwrap();
+    let replacement = table
+        .replace_window(vec![batch("2026-01-02")])
+        .await
+        .unwrap();
+
+    assert_eq!(replacement.rewritten_files.len(), 1);
+    assert_eq!(replacement.retired_files, replacement.rewritten_files);
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.inline_observations
+              WHERE observed = '2026-01-02' AND end_snapshot = (SELECT max(snapshot_id) FROM ducklake.ducklake_snapshot)"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.inline_observations
+              WHERE observed = '2025-12-31' AND end_snapshot IS NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT record_count FROM ducklake.ducklake_table_stats WHERE table_id = 1"
+        )
+        .await,
+        6
+    );
+
+    client
+        .batch_execute("DROP SCHEMA ducklake CASCADE")
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
 async fn repack_expiry_policies_retention_and_atomicity() {
     use dkplus::maintenance::{CleanupOptions, CleanupScope, cleanup_expired_files};
     use dkplus::repack::ExpireSnapshot;

@@ -20,6 +20,21 @@ const SNAPSHOT_FIELD: &str = "2147483539";
 const FAST_READ_CONCURRENCY: usize = 8;
 const FAST_PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
 
+#[derive(Clone, Copy)]
+pub(crate) struct Window {
+    pub(crate) start: DateTime<Utc>,
+    pub(crate) end: DateTime<Utc>,
+}
+
+impl Window {
+    fn for_job(job: &Job) -> Result<Self> {
+        Ok(Self {
+            start: job.start()?,
+            end: job.end()?,
+        })
+    }
+}
+
 fn progress(log: &Log, message: String) {
     log(&format!("repack: {message}"));
 }
@@ -331,7 +346,8 @@ async fn sources(
     c: &impl GenericClient,
     table_id: i64,
     utc_col: i64,
-    job: &Job,
+    table: &Table,
+    window: Window,
 ) -> Result<Vec<Source>> {
     let rows = c.query(
         &format!("SELECT f.data_file_id, f.path, f.path_is_relative, f.record_count, f.row_id_start,
@@ -346,8 +362,8 @@ async fn sources(
           WHERE f.table_id = $1 AND f.end_snapshot IS NULL
             AND (s.min_value IS NULL OR s.max_value IS NULL OR s.null_count > 0
                  OR (s.min_value::{ty} < $4::text::{ty} AND s.max_value::{ty} >= $3::text::{ty}))
-          ORDER BY f.data_file_id", ty = job.table.time_type.sql()),
-        &[&table_id, &utc_col, &job.table.bound(job.start()?), &job.table.bound(job.end()?)]
+          ORDER BY f.data_file_id", ty = table.time_type.sql()),
+        &[&table_id, &utc_col, &table.bound(window.start), &table.bound(window.end)]
     ).await.context("reading repack source files")?;
     let mut out = Vec::new();
     for r in rows {
@@ -488,19 +504,19 @@ fn normalize(
     Ok(batch)
 }
 
-fn split(batch: &RecordBatch, job: &Job) -> Result<[RecordBatch; 3]> {
-    let column = batch.column(batch.schema().index_of(&job.table.time_column)?);
+fn split_in_window(batch: &RecordBatch, table: &Table, window: Window) -> Result<[RecordBatch; 3]> {
+    let column = batch.column(batch.schema().index_of(&table.time_column)?);
     if column.null_count() != 0 {
         bail!("window column contains nulls; cannot safely repack");
     }
-    let (times, start, end) = match job.table.time_type {
+    let (times, start, end) = match table.time_type {
         TimeType::TimestampTz | TimeType::Timestamp => (
             column
                 .as_primitive::<TimestampMicrosecondType>()
                 .values()
                 .to_vec(),
-            job.start()?.timestamp_micros(),
-            job.end()?.timestamp_micros(),
+            window.start.timestamp_micros(),
+            window.end.timestamp_micros(),
         ),
         TimeType::Date => (
             column
@@ -509,10 +525,14 @@ fn split(batch: &RecordBatch, job: &Job) -> Result<[RecordBatch; 3]> {
                 .iter()
                 .map(|v| i64::from(*v))
                 .collect(),
-            job.begin_date
+            window
+                .start
+                .date_naive()
                 .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
                 .num_days(),
-            job.end_date
+            window
+                .end
+                .date_naive()
                 .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
                 .num_days(),
         ),
@@ -539,6 +559,11 @@ fn split(batch: &RecordBatch, job: &Job) -> Result<[RecordBatch; 3]> {
     batches
         .try_into()
         .map_err(|_| anyhow!("expected three date regions"))
+}
+
+#[cfg(test)]
+fn split(batch: &RecordBatch, job: &Job) -> Result<[RecordBatch; 3]> {
+    split_in_window(batch, &job.table, Window::for_job(job)?)
 }
 
 fn location(meta: &TableMeta, path: &str, relative: bool) -> String {
@@ -867,6 +892,8 @@ async fn try_aligned(
     meta: &TableMeta,
     sources: &[Source],
     job: &Job,
+    window: Window,
+    discard_inside: bool,
     work: &mut Work,
     target: &SchemaRef,
     cols: &[&Column],
@@ -994,12 +1021,49 @@ async fn try_aligned(
             last_progress = Instant::now();
         }
     }
-    align_cursors(cursors, job, work, target, cols, row_group_col, log).await
+    align_cursors_with_window(
+        cursors,
+        job,
+        window,
+        discard_inside,
+        work,
+        target,
+        cols,
+        row_group_col,
+        log,
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn align_cursors(
+    cursors: Vec<FastCursor>,
+    job: &Job,
+    work: &mut Work,
+    target: &SchemaRef,
+    cols: &[&Column],
+    row_group_col: &str,
+    log: &Log,
+) -> Result<Option<(Vec<FileInfo>, i64, i64)>> {
+    align_cursors_with_window(
+        cursors,
+        job,
+        Window::for_job(job)?,
+        false,
+        work,
+        target,
+        cols,
+        row_group_col,
+        log,
+    )
+    .await
+}
+
+async fn align_cursors_with_window(
     mut cursors: Vec<FastCursor>,
     job: &Job,
+    window: Window,
+    discard_inside: bool,
     work: &mut Work,
     target: &SchemaRef,
     cols: &[&Column],
@@ -1027,6 +1091,7 @@ async fn align_cursors(
         }};
     }
     let mut live_rows = 0i64;
+    let mut output_rows = 0i64;
     let mut removed = 0i64;
     let mut nodes_written = 0usize;
     let mut last_progress = Instant::now();
@@ -1168,8 +1233,14 @@ async fn align_cursors(
             ));
         }
         live_rows += node.num_rows() as i64;
-        let mut regions = split(&node, job)?;
-        if let Some(unique) = job.effective_unique() {
+        let mut regions = split_in_window(&node, &job.table, window)?;
+        output_rows += regions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !discard_inside || *index != 1)
+            .map(|(_, batch)| batch.num_rows() as i64)
+            .sum::<i64>();
+        if !discard_inside && let Some(unique) = job.effective_unique() {
             let (deduplicated, count) = sort::deduplicate_batch(
                 &regions[1],
                 unique,
@@ -1201,6 +1272,9 @@ async fn align_cursors(
         let budget = work.node_bytes;
         let write = async {
             for (index, batch) in regions.iter().enumerate() {
+                if discard_inside && index == 1 {
+                    continue;
+                }
                 if batch.num_rows() == 0 {
                     continue;
                 }
@@ -1294,7 +1368,7 @@ async fn align_cursors(
     for writer in writers.into_iter().flatten() {
         files.push(fast_wait(log, job, "finalizing output file", writer.finish()).await?);
     }
-    if files.iter().map(|file| file.rows).sum::<i64>() != live_rows - removed {
+    if files.iter().map(|file| file.rows).sum::<i64>() != output_rows - removed {
         bail!("aligned repack row count mismatch");
     }
     fast_progress(
@@ -1314,6 +1388,8 @@ async fn prepare(
     meta: &TableMeta,
     sources: &[Source],
     job: &Job,
+    window: Window,
+    discard_inside: bool,
     work: &mut Work,
     log: &Log,
 ) -> Result<Vec<FileInfo>> {
@@ -1321,7 +1397,19 @@ async fn prepare(
     job.validate_schema(&data_schema)?;
     let target = with_identity(&data_schema);
     let cols = resolve_columns(meta, &data_schema)?;
-    if let Some((files, _, _)) = try_aligned(meta, sources, job, work, &target, &cols, log).await? {
+    if let Some((files, _, _)) = try_aligned(
+        meta,
+        sources,
+        job,
+        window,
+        discard_inside,
+        work,
+        &target,
+        &cols,
+        log,
+    )
+    .await?
+    {
         return Ok(files);
     }
     if !work.outputs.is_empty() {
@@ -1338,6 +1426,7 @@ async fn prepare(
         );
     }
     let mut live_rows = 0i64;
+    let mut discarded_rows = 0i64;
     for (index, source) in sources.iter().enumerate() {
         let started = std::time::Instant::now();
         progress(
@@ -1370,8 +1459,14 @@ async fn prepare(
             offset += batch.num_rows() as i64;
             let batch = filter_record_batch(&normalized, &keep)?;
             live_rows += batch.num_rows() as i64;
-            for (run, batch) in runs.iter_mut().zip(split(&batch, job)?) {
-                run.push(batch, work).await?;
+            let regions = split_in_window(&batch, &job.table, window)?;
+            if discard_inside {
+                discarded_rows += regions[1].num_rows() as i64;
+            }
+            for (index, (run, batch)) in runs.iter_mut().zip(regions).enumerate() {
+                if !discard_inside || index != 1 {
+                    run.push(batch, work).await?;
+                }
             }
         }
         if offset != source.rows {
@@ -1423,7 +1518,7 @@ async fn prepare(
             files.push(file);
         }
     }
-    if files.iter().map(|f| f.rows).sum::<i64>() != live_rows - removed {
+    if files.iter().map(|f| f.rows).sum::<i64>() != live_rows - discarded_rows - removed {
         bail!("repack row count mismatch");
     }
     Ok(files)
@@ -1480,11 +1575,61 @@ async fn has_current_files(c: &impl GenericClient, table_id: i64, job: &Job) -> 
     .try_get(0)?)
 }
 
-async fn check_inlined(c: &impl GenericClient, table_id: i64, job: &Job) -> Result<()> {
-    if has_inlined_rows(c, table_id, &job.table, job.start()?, job.end()?).await? {
+async fn check_inlined(
+    c: &impl GenericClient,
+    table_id: i64,
+    table: &Table,
+    window: Window,
+) -> Result<()> {
+    if has_inlined_rows(c, table_id, table, window.start, window.end).await? {
         bail!("range contains inlined data; flush it to Parquet before repacking");
     }
     Ok(())
+}
+
+async fn retire_inlined_rows(
+    tx: &impl GenericClient,
+    table_id: i64,
+    table: &Table,
+    window: Window,
+    snapshot: i64,
+) -> Result<i64> {
+    let names = tx
+        .query(
+            "SELECT table_name FROM ducklake.ducklake_inlined_data_tables WHERE table_id = $1",
+            &[&table_id],
+        )
+        .await
+        .context("reading inlined data tables for replacement")?;
+    let mut removed = 0i64;
+    for row in names {
+        let name: String = row.get(0);
+        let count = tx
+            .execute(
+                &format!(
+                    "UPDATE ducklake.{} SET end_snapshot = $1
+                      WHERE end_snapshot IS NULL
+                        AND {}::{} >= $2::text::{}
+                        AND {}::{} < $3::text::{}",
+                    identifier(&name)?,
+                    identifier(&table.time_column)?,
+                    table.time_type.sql(),
+                    table.time_type.sql(),
+                    identifier(&table.time_column)?,
+                    table.time_type.sql(),
+                    table.time_type.sql()
+                ),
+                &[
+                    &snapshot,
+                    &table.bound(window.start),
+                    &table.bound(window.end),
+                ],
+            )
+            .await
+            .with_context(|| format!("retiring inlined rows in {name}"))?;
+        removed += i64::try_from(count).context("inlined row count overflow")?;
+    }
+    Ok(removed)
 }
 
 async fn commit(
@@ -1493,8 +1638,10 @@ async fn commit(
     utc_col: i64,
     selected: &[Source],
     job: &Job,
+    window: Window,
     files: &[FileInfo],
-) -> Result<i64> {
+    replacement: Option<&crate::FileInfo>,
+) -> Result<(i64, Option<i64>, i64, i64)> {
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
@@ -1515,11 +1662,13 @@ async fn commit(
         .await?;
     let (prev, version, next_catalog, next_file): (i64, i64, i64, i64) =
         (snap.get(0), snap.get(1), snap.get(2), snap.get(3));
-    let current = sources(&tx, meta.table_id, utc_col, job).await?;
+    let current = sources(&tx, meta.table_id, utc_col, &job.table, window).await?;
     if current != selected {
         bail!("repack sources changed while sorting; retry the job");
     }
-    check_inlined(&tx, meta.table_id, job).await?;
+    if replacement.is_none() {
+        check_inlined(&tx, meta.table_id, &job.table, window).await?;
+    }
     // A schema change can leave the same files active. Reject rather than publish stale field IDs.
     let (schema_name, table_name) = job.names();
     if table_meta(&tx, schema_name, table_name).await? != *meta {
@@ -1530,7 +1679,7 @@ async fn commit(
         .map(|s| s.rows - s.delete.as_ref().map_or(0, |d| d.count))
         .sum::<i64>()
         - files.iter().map(|f| f.rows).sum::<i64>();
-    if removed < 0 || (job.effective_unique().is_none() && removed != 0) {
+    if removed < 0 || (replacement.is_none() && job.effective_unique().is_none() && removed != 0) {
         bail!("invalid repack logical row count change: {removed}");
     }
     let snapshot_id = prev + 1;
@@ -1542,25 +1691,54 @@ async fn commit(
             &snapshot_id,
             &version,
             &next_catalog,
-            &(next_file + files.len() as i64),
+            &(next_file + files.len() as i64 + i64::from(replacement.is_some())),
         ],
     )
     .await?;
+    let inlined_removed = if replacement.is_some() {
+        retire_inlined_rows(&tx, meta.table_id, &job.table, window, snapshot_id).await?
+    } else {
+        0
+    };
     tx.execute(
         "INSERT INTO ducklake.ducklake_snapshot_changes
          (snapshot_id, changes_made, author, commit_message, commit_extra_info)
          VALUES ($1, $2, $3, $4, NULL)",
         &[
             &snapshot_id,
-            &if removed > 0 {
-                format!("compacted_table:{0},deleted_from_table:{0}", meta.table_id)
-            } else {
-                format!("compacted_table:{}", meta.table_id)
+            &match (replacement.is_some(), removed + inlined_removed > 0) {
+                (true, true) => {
+                    format!(
+                        "inserted_into_table:{0},deleted_from_table:{0}",
+                        meta.table_id
+                    )
+                }
+                (true, false) => format!("inserted_into_table:{}", meta.table_id),
+                (false, true) => {
+                    format!("compacted_table:{0},deleted_from_table:{0}", meta.table_id)
+                }
+                (false, false) => format!("compacted_table:{}", meta.table_id),
             },
-            &job.table.author_for("repacker", job.start()?, job.end()?),
+            &job.table.author_for(
+                if replacement.is_some() {
+                    "writer"
+                } else {
+                    "repacker"
+                },
+                window.start,
+                window.end,
+            ),
             &format!(
-                "repack {} [{}, {}) {}",
-                job.table, job.begin_date, job.end_date, job.table.timezone
+                "{} {} [{}, {}) {}",
+                if replacement.is_some() {
+                    "replace"
+                } else {
+                    "repack"
+                },
+                job.table,
+                window.start,
+                window.end,
+                job.table.timezone
             ),
         ],
     )
@@ -1622,31 +1800,210 @@ async fn commit(
             .await?;
         }
     }
+    let replacement_id = if let Some(file) = replacement {
+        let id = next_file + files.len() as i64;
+        let stats_row = tx
+            .query_opt(
+                "SELECT next_row_id FROM ducklake.ducklake_table_stats WHERE table_id = $1",
+                &[&meta.table_id],
+            )
+            .await?;
+        let row_id_start: i64 = stats_row
+            .as_ref()
+            .and_then(|row| row.get::<_, Option<i64>>(0))
+            .unwrap_or(0);
+        tx.execute(
+            "INSERT INTO ducklake.ducklake_data_file
+             (data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path,
+              path_is_relative, file_format, record_count, file_size_bytes, footer_size,
+              row_id_start, partition_id, encryption_key, mapping_id, partial_max)
+             VALUES ($1,$2,$3,NULL,NULL,$4,true,'parquet',$5,$6,$7,$8,NULL,NULL,NULL,NULL)",
+            &[
+                &id,
+                &meta.table_id,
+                &snapshot_id,
+                &file.name,
+                &file.rows,
+                &file.size,
+                &file.footer,
+                &row_id_start,
+            ],
+        )
+        .await?;
+        for stat in &file.stats {
+            tx.execute(
+                "INSERT INTO ducklake.ducklake_file_column_stats
+                 (data_file_id,table_id,column_id,column_size_bytes,value_count,null_count,
+                  min_value,max_value,contains_nan,extra_stats)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL)",
+                &[
+                    &id,
+                    &meta.table_id,
+                    &stat.column_id,
+                    &stat.size_bytes,
+                    &stat.value_count,
+                    &stat.null_count,
+                    &stat.min,
+                    &stat.max,
+                    &stat.contains_nan,
+                ],
+            )
+            .await?;
+        }
+        crate::update_table_stats(
+            &tx,
+            meta.table_id,
+            stats_row.is_some(),
+            row_id_start + file.rows,
+            &file.stats,
+        )
+        .await?;
+        Some(id)
+    } else {
+        None
+    };
     // Deleted rows leave safe, conservative column bounds and do not reuse row IDs.
-    let updated = tx
-        .execute(
-            "UPDATE ducklake.ducklake_table_stats SET
+    if replacement.is_none() {
+        let updated = tx
+            .execute(
+                "UPDATE ducklake.ducklake_table_stats SET
          file_size_bytes = (SELECT COALESCE(SUM(file_size_bytes),0)::bigint
            FROM ducklake.ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL),
          record_count = record_count - $2
          WHERE table_id = $1",
-            &[&meta.table_id, &removed],
-        )
-        .await?;
-    if updated != 1 {
-        bail!("table statistics missing while committing compaction");
+                &[&meta.table_id, &removed],
+            )
+            .await?;
+        if updated != 1 {
+            bail!("table statistics missing while committing compaction");
+        }
     }
     if expire {
         expire::predecessor(&tx, meta, selected, prev).await?;
     }
     tx.commit().await.context("committing repack snapshot")?;
-    Ok(snapshot_id)
+    Ok((
+        snapshot_id,
+        replacement_id,
+        inlined_removed,
+        removed + inlined_removed,
+    ))
+}
+
+pub(crate) async fn replace_window(
+    client: &mut Client,
+    meta: &TableMeta,
+    utc_col: i64,
+    table: &Table,
+    window: Window,
+    incoming: &crate::FileInfo,
+) -> Result<crate::LoadReport> {
+    if table.cfg.repack_run_bytes == 0 || table.cfg.repack_node_bytes == 0 {
+        bail!("repack memory budgets must be positive");
+    }
+    let last = window
+        .end
+        .checked_sub_signed(chrono::Duration::microseconds(1))
+        .context("replacement window underflow")?;
+    let date = |time: DateTime<Utc>| match table.time_type {
+        TimeType::TimestampTz => time.with_timezone(&table.timezone).date_naive(),
+        TimeType::Timestamp | TimeType::Date => time.date_naive(),
+    };
+    let begin_date = date(window.start);
+    let end_date = date(last)
+        .succ_opt()
+        .context("replacement window end is out of range")?;
+    let job = Job {
+        table: table.clone(),
+        begin_date,
+        end_date,
+        unique: None,
+        files: None,
+        expire_snapshot: ExpireSnapshot::Never,
+    };
+    job.validate()?;
+    lock_range(client, &job).await?;
+    let tx = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await?;
+    let selected = sources(&tx, meta.table_id, utc_col, table, window).await?;
+    tx.commit().await?;
+
+    let (store, prefix) = object_store_for(&table.cfg, &meta.root)?;
+    let mut work = Work::with_limits(
+        store,
+        prefix,
+        table.cfg.repack_run_bytes,
+        table.cfg.repack_node_bytes,
+    );
+    let result = async {
+        let files = if selected.is_empty() {
+            Vec::new()
+        } else {
+            prepare(
+                &table.cfg,
+                meta,
+                &selected,
+                &job,
+                window,
+                true,
+                &mut work,
+                &table.cfg.log,
+            )
+            .await?
+        };
+        work.outputs.clear();
+        let mut attempt = 1;
+        let (snapshot_id, incoming_id) = loop {
+            match commit(
+                client,
+                meta,
+                utc_col,
+                &selected,
+                &job,
+                window,
+                &files,
+                Some(incoming),
+            )
+            .await
+            {
+                Ok((snapshot_id, incoming_id, _, _)) => break (snapshot_id, incoming_id),
+                Err(error) if is_commit_conflict(&error) && attempt < MAX_COMMIT_ATTEMPTS => {
+                    (table.cfg.log)(&format!(
+                        "replacement commit conflict (attempt {attempt}), retrying: {error:#}"
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64))
+                        .await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let data_file_id = incoming_id.context("replacement file was not published")?;
+        Ok(crate::LoadReport {
+            snapshot_id,
+            data_file_id,
+            path: format!("{}{}", meta.root, incoming.name),
+            rows: incoming.rows,
+            file_size_bytes: incoming.size,
+            retired_rows: selected.iter().map(|source| source.rows).sum(),
+            retired_files: selected.iter().map(|source| source.id).collect(),
+            rewritten_files: selected.iter().map(|source| source.id).collect(),
+        })
+    }
+    .await;
+    work.cleanup(&table.cfg.log).await;
+    result
 }
 
 async fn run(job: &Job) -> Result<()> {
     let cfg = &job.table.cfg;
     let log = &cfg.log;
     job.validate()?;
+    let window = Window::for_job(job)?;
     if cfg.repack_run_bytes == 0 || cfg.repack_node_bytes == 0 {
         bail!("repack memory budgets must be positive");
     }
@@ -1710,8 +2067,8 @@ async fn run(job: &Job) -> Result<()> {
             meta.table_id
         ),
     );
-    check_inlined(&tx, meta.table_id, job).await?;
-    let selected = sources(&tx, meta.table_id, utc_col, job).await?;
+    check_inlined(&tx, meta.table_id, &job.table, window).await?;
+    let selected = sources(&tx, meta.table_id, utc_col, &job.table, window).await?;
     tx.commit().await?;
     if selected.is_empty() {
         progress(log, "no source files overlap the requested range".into());
@@ -1735,14 +2092,35 @@ async fn run(job: &Job) -> Result<()> {
         ),
     );
     let result = async {
-        let files = prepare(cfg, &meta, &selected, job, &mut work, log).await?;
+        let files = prepare(
+            cfg,
+            &meta,
+            &selected,
+            job,
+            window,
+            false,
+            &mut work,
+            log,
+        )
+        .await?;
         // Never delete published files if a lost COMMIT response makes the outcome uncertain.
         work.outputs.clear();
         let mut attempt = 1;
         let snapshot = loop {
             progress(log, format!("publishing {} replacement files (attempt {attempt})", files.len()));
-            match commit(&mut client, &meta, utc_col, &selected, job, &files).await {
-                Ok(snapshot) => break snapshot,
+            match commit(
+                &mut client,
+                &meta,
+                utc_col,
+                &selected,
+                job,
+                window,
+                &files,
+                None,
+            )
+            .await
+            {
+                Ok((snapshot, _, _, _)) => break snapshot,
                 Err(e) if is_commit_conflict(&e) && attempt < MAX_COMMIT_ATTEMPTS => {
                     progress(log, format!("repack commit conflict (attempt {attempt}); retrying: {e:#}"));
                     tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64)).await;
@@ -1821,6 +2199,31 @@ mod tests {
                 assert_eq!(batch, &input.slice(index, 1));
             }
         }
+    }
+
+    #[test]
+    fn replacement_split_uses_exact_microsecond_bounds() {
+        use datafusion::arrow::array::TimestampMicrosecondArray;
+        let mut table = test_job(None).table;
+        table.time_type = TimeType::Timestamp;
+        table.time_column = "observed".into();
+        let column = Arc::new(TimestampMicrosecondArray::from(vec![100, 200, 300]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "observed",
+            column.data_type().clone(),
+            false,
+        )]));
+        let input = RecordBatch::try_new(schema, vec![column]).unwrap();
+        let window = Window {
+            start: DateTime::from_timestamp_micros(200).unwrap(),
+            end: DateTime::from_timestamp_micros(201).unwrap(),
+        };
+
+        let regions = split_in_window(&input, &table, window).unwrap();
+
+        assert_eq!(regions[0], input.slice(0, 1));
+        assert_eq!(regions[1], input.slice(1, 1));
+        assert_eq!(regions[2], input.slice(2, 1));
     }
     use async_trait::async_trait;
     use datafusion::arrow::array::{StringArray, TimestampMicrosecondArray};
