@@ -141,6 +141,120 @@ async fn count(client: &tokio_postgres::Client, sql: &str) -> i64 {
 
 #[tokio::test]
 #[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+async fn table_tag_updates_are_versioned_together_in_one_snapshot() {
+    let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    let (cfg, job, initial) = expiry_fixture(&client, &postgres).await;
+
+    let snapshot_id = job
+        .table
+        .update_tags(std::collections::HashMap::from([
+            ("dkplus.timezone".into(), Some(r#""America/Denver""#.into())),
+            ("dkplus.row_group_col".into(), None),
+            (
+                "dkplus.unique_by_cols".into(),
+                Some(r#"["station"]"#.into()),
+            ),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(snapshot_id, initial.snapshot_id + 1);
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.ducklake_snapshot WHERE snapshot_id = 2"
+        )
+        .await,
+        1
+    );
+    let changes: String = client
+        .query_one(
+            "SELECT changes_made FROM ducklake.ducklake_snapshot_changes WHERE snapshot_id = $1",
+            &[&snapshot_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(changes, "altered_table:1");
+
+    let active_tags = client
+        .query(
+            "SELECT key, value FROM ducklake.ducklake_tag
+              WHERE object_id = 1 AND begin_snapshot <= $1
+                AND (end_snapshot IS NULL OR end_snapshot > $1)",
+            &[&snapshot_id],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        active_tags.get("dkplus.timezone").map(String::as_str),
+        Some(r#""America/Denver""#)
+    );
+    assert_eq!(
+        active_tags.get("dkplus.unique_by_cols").map(String::as_str),
+        Some(r#"["station"]"#)
+    );
+    assert!(!active_tags.contains_key("dkplus.row_group_col"));
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.ducklake_tag
+              WHERE object_id = 1 AND key = 'dkplus.row_group_col'
+                AND end_snapshot = 2"
+        )
+        .await,
+        1
+    );
+
+    let resolved = Table::builder("weather", "observations")
+        .resolve(&cfg)
+        .await
+        .unwrap();
+    assert_eq!(resolved.timezone, chrono_tz::America::Denver);
+    assert_eq!(resolved.row_group_col, None);
+    assert_eq!(
+        resolved.unique_by_cols.as_deref(),
+        Some(&["station".into()][..])
+    );
+
+    let unchanged = job
+        .table
+        .update_tags(std::collections::HashMap::from([
+            ("dkplus.timezone".into(), Some(r#""America/Denver""#.into())),
+            ("dkplus.row_group_col".into(), None),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(unchanged, snapshot_id);
+    assert_eq!(
+        job.table
+            .update_tags(std::collections::HashMap::new())
+            .await
+            .unwrap(),
+        snapshot_id
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM ducklake.ducklake_snapshot").await,
+        snapshot_id + 1
+    );
+
+    client
+        .batch_execute("DROP SCHEMA ducklake CASCADE")
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
 async fn inferred_replacement_retires_inclusive_bounds_and_gaps() {
     let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
         .unwrap()

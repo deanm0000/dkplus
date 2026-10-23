@@ -191,7 +191,7 @@ values and active DuckLake table tags. Explicit values override tags. Required
 settings left unresolved by both sources fail with an error.
 Resolve a builder when starting an operation to pick up the latest committed
 tags. `with_*` values are per-table overrides and do not write tags back to
-DuckLake; use DuckLake's tag-management support to persist changes.
+DuckLake; use `Table::update_tags` to persist changes.
 
 | Setting | Meaning |
 |---|---|
@@ -204,13 +204,88 @@ DuckLake; use DuckLake's tag-management support to persist changes.
 | `lock_namespace` | Optional explicit lock namespace; defaults to the table name. |
 | `author` | Optional snapshot author override; defaults to an operation/window-derived value. |
 
-The recognized settings are table-level entries in DuckLake's `ducklake_tag` table,
-namespaced as `dkplus.time_column`, `dkplus.timezone`, `dkplus.row_group_col`,
-`dkplus.sort_cols`, `dkplus.unique_by_cols`, and `dkplus.dedup_timestamp`.
-String settings are JSON strings and list settings are JSON arrays; nullable
-optional settings can be JSON `null`. `ducklake_tag` values are snapshot-versioned;
-the builder reads values active in the catalog's latest snapshot. Manage tags
-through DuckLake's tag facilities rather than editing catalog tables directly.
+The recognized settings are table-level entries in DuckLake's `ducklake_tag` table.
+The `key` identifies the setting, and `value` is a string containing JSON:
+
+| Tag key | JSON value example | How dkplus uses it |
+|---|---|---|
+| `dkplus.time_column` | `"observed"` | Required column defining repack windows. Its catalog type determines whether boundaries are dates or timestamps. |
+| `dkplus.timezone` | `"America/New_York"` | Required IANA time zone for resolving boundaries when the time column is `timestamptz`. |
+| `dkplus.row_group_col` | `"station"` or `null` | Optional row-group key. When set, it must be the first column in `dkplus.sort_cols`. |
+| `dkplus.sort_cols` | `["station", "observed"]` | Required ascending sort order for repacked files. |
+| `dkplus.unique_by_cols` | `["station", "observed"]` or `null` | Optional duplicate key. When set, dkplus keeps the row selected using `dkplus.dedup_timestamp`. |
+| `dkplus.dedup_timestamp` | `"fetched_at"` or `null` | Optional microsecond timestamp column used to select a retained row for each duplicate key. Required when `unique_by_cols` is set. |
+
+For example, the tag values for a table configured to group and sort by station
+could be:
+
+```text
+dkplus.time_column      = "observed"
+dkplus.timezone         = "America/New_York"
+dkplus.row_group_col    = "station"
+dkplus.sort_cols        = ["station", "observed"]
+dkplus.unique_by_cols   = ["station", "observed"]
+dkplus.dedup_timestamp  = "fetched_at"
+```
+
+List values are JSON arrays; nullable optional values can be JSON `null` (for
+example, `dkplus.row_group_col = null` disables row grouping). Missing optional
+tags also mean no grouping or deduplication. The builder reads only values
+active at the latest catalog snapshot. Explicit `Table::builder(...).with_*`
+settings override the corresponding tags and are not written back to DuckLake.
+
+### Inspecting tags with DuckDB Python
+
+The DuckLake extension exposes table tags through DuckDB's `duckdb_tables()`
+metadata function. For an existing DuckLake catalog, attach it and query the
+tag map for the table:
+
+```python
+import duckdb
+
+con = duckdb.connect()
+con.execute("INSTALL ducklake")
+con.execute("LOAD ducklake")
+con.execute("ATTACH 'ducklake:metadata.ducklake' AS lake")
+
+tags = con.execute("""
+    SELECT tags
+    FROM duckdb_tables()
+    WHERE database_name = 'lake'
+      AND schema_name = 'weather'
+      AND table_name = 'observations'
+""").fetchone()[0]
+print(tags)
+```
+
+Replace the attach string with the connection string for your catalog. The
+DuckLake extension has no supported SQL command for writing arbitrary tags.
+Use dkplus's `Table::update_tags` method rather than editing `ducklake_tag`
+rows directly; it versions the changes and groups them into one snapshot.
+
+The Python SDK and DuckDB extension do not currently provide arbitrary tag
+writes. Use the Rust API:
+
+```rust,no_run
+use std::collections::HashMap;
+
+async fn update_policy(table: &dkplus::Table) -> anyhow::Result<i64> {
+    let snapshot_id = table.update_tags(HashMap::from([
+        ("dkplus.time_column".into(), Some(r#""observed""#.into())),
+        ("dkplus.timezone".into(), Some(r#""America/New_York""#.into())),
+        ("dkplus.row_group_col".into(), Some(r#""station""#.into())),
+        ("dkplus.sort_cols".into(), Some(r#"["station","observed"]"#.into())),
+        ("dkplus.unique_by_cols".into(), Some(r#"["station","observed"]"#.into())),
+        ("dkplus.dedup_timestamp".into(), Some(r#""fetched_at""#.into())),
+    ])).await?;
+    Ok(snapshot_id)
+}
+```
+
+Each map entry changes only its named key: `Some(value)` adds or replaces its
+value, and `None` removes it. Values are stored as provided, so dkplus settings
+must be JSON-encoded strings. All effective changes in one call share a
+snapshot; unchanged requests do not create a new snapshot.
 
 ### 2. Write to DuckLake
 

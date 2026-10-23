@@ -935,6 +935,135 @@ impl Table {
         ))
     }
 
+    /// Add, replace, or remove table tags in one DuckLake snapshot.
+    ///
+    /// Each map entry updates only its key: `Some(value)` sets the raw tag
+    /// value, while `None` removes the tag. Tag values used by dkplus settings
+    /// should be JSON-encoded strings. The returned snapshot ID is unchanged
+    /// when every requested update is already in effect.
+    pub async fn update_tags(&self, updates: HashMap<String, Option<String>>) -> Result<i64> {
+        if updates.keys().any(|key| key.is_empty()) {
+            bail!("DuckLake tag keys must not be empty");
+        }
+        let mut client = connect(&self.cfg).await?;
+        let tx = client.transaction().await?;
+        tx.batch_execute("LOCK TABLE ducklake.ducklake_snapshot IN SHARE ROW EXCLUSIVE MODE")
+            .await
+            .context("locking catalog snapshots for tag update")?;
+
+        let meta = table_meta(&tx, &self.schema, &self.table).await?;
+        let latest = tx
+            .query_one(
+                "SELECT snapshot_id, schema_version, next_catalog_id, next_file_id
+                   FROM ducklake.ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1",
+                &[],
+            )
+            .await
+            .context("reading latest snapshot for tag update")?;
+        let (previous, schema_version, next_catalog_id, next_file_id): (i64, i64, i64, i64) =
+            (latest.get(0), latest.get(1), latest.get(2), latest.get(3));
+
+        if updates.is_empty() {
+            tx.commit().await.context("finishing empty tag update")?;
+            return Ok(previous);
+        }
+
+        let keys: Vec<_> = updates.keys().cloned().collect();
+        let rows = tx
+            .query(
+                "SELECT key, value FROM ducklake.ducklake_tag
+                  WHERE object_id = $1 AND key = ANY($2)
+                    AND begin_snapshot <= $3
+                    AND (end_snapshot IS NULL OR end_snapshot > $3)",
+                &[&meta.table_id, &keys, &previous],
+            )
+            .await
+            .context("reading active table tags")?;
+        let mut active = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let key: String = row.get(0);
+            let value: String = row.get(1);
+            if active.insert(key.clone(), value).is_some() {
+                bail!("multiple active DuckLake tags for key {key:?}");
+            }
+        }
+
+        let changed = updates
+            .iter()
+            .any(|(key, value)| active.get(key) != value.as_ref());
+        if !changed {
+            tx.commit()
+                .await
+                .context("finishing unchanged tag update")?;
+            return Ok(previous);
+        }
+
+        let snapshot_id = previous + 1;
+        tx.execute(
+            "INSERT INTO ducklake.ducklake_snapshot
+               (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
+             VALUES ($1, now(), $2, $3, $4)",
+            &[
+                &snapshot_id,
+                &schema_version,
+                &next_catalog_id,
+                &next_file_id,
+            ],
+        )
+        .await
+        .context("inserting tag update snapshot")?;
+        tx.execute(
+            "INSERT INTO ducklake.ducklake_snapshot_changes
+               (snapshot_id, changes_made, author, commit_message, commit_extra_info)
+             VALUES ($1, $2, $3, $4, NULL)",
+            &[
+                &snapshot_id,
+                &format!("altered_table:{}", meta.table_id),
+                &self.author.as_deref().unwrap_or("dkplus"),
+                &format!("updated tags for {self}"),
+            ],
+        )
+        .await
+        .context("recording tag update snapshot changes")?;
+
+        for (key, value) in updates {
+            let current = active.get(&key);
+            if current == value.as_ref() {
+                continue;
+            }
+            if current.is_some() {
+                let ended = tx
+                    .execute(
+                        "UPDATE ducklake.ducklake_tag SET end_snapshot = $4
+                          WHERE object_id = $1 AND key = $2
+                            AND begin_snapshot <= $3
+                            AND (end_snapshot IS NULL OR end_snapshot > $3)",
+                        &[&meta.table_id, &key, &previous, &snapshot_id],
+                    )
+                    .await
+                    .with_context(|| format!("ending active DuckLake tag {key:?}"))?;
+                if ended != 1 {
+                    bail!("active DuckLake tag {key:?} changed during update");
+                }
+            }
+            if let Some(value) = value {
+                tx.execute(
+                    "INSERT INTO ducklake.ducklake_tag
+                       (object_id, begin_snapshot, end_snapshot, key, value)
+                     VALUES ($1, $2, NULL, $3, $4)",
+                    &[&meta.table_id, &snapshot_id, &key, &value],
+                )
+                .await
+                .with_context(|| format!("writing DuckLake tag {key:?}"))?;
+            }
+        }
+
+        tx.commit()
+            .await
+            .context("committing tag update snapshot")?;
+        Ok(snapshot_id)
+    }
+
     /// Replace the range from the minimum through maximum input time, inclusive.
     /// The half-open upper bound is one day (date) or microsecond (timestamp) later.
     pub async fn replace_window(&self, batches: Vec<RecordBatch>) -> Result<LoadReport> {
@@ -1137,6 +1266,14 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("schemas differ")
+        );
+        assert!(
+            table
+                .update_tags(HashMap::from([("".into(), Some("value".into()))]))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("tag keys must not be empty")
         );
     }
 
