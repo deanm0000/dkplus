@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 mod expire;
+pub(crate) mod merge_diff;
 mod sort;
 
 const ROW_ID: &str = "_ducklake_internal_row_id";
@@ -1656,6 +1657,7 @@ struct CommitContext<'a> {
     window: Window,
     files: &'a [FileInfo],
     replacement: Option<&'a crate::FileInfo>,
+    diff: Option<merge_diff::DiffCommit<'a>>,
 }
 
 async fn commit(
@@ -1670,7 +1672,11 @@ async fn commit(
         window,
         files,
         replacement,
+        diff,
     } = context;
+    let diff_file = diff
+        .as_ref()
+        .and_then(|diff| diff.file.map(|file| (diff.meta, file)));
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
@@ -1703,6 +1709,14 @@ async fn commit(
     if table_meta(&tx, schema_name, table_name).await? != *meta {
         bail!("table metadata changed while sorting; retry the job");
     }
+    if let Some(diff) = &diff {
+        if table_meta(&tx, &diff.table.schema, &diff.table.table).await? != *diff.meta {
+            bail!("diff table metadata changed while merging; retry the job");
+        }
+        if merge_diff::read_inlined(&tx, meta, &job.table, window).await? != diff.inlined {
+            bail!("inlined rows changed while merging; retry the job");
+        }
+    }
     let removed = selected
         .iter()
         .map(|s| s.rows - s.delete.as_ref().map_or(0, |d| d.count))
@@ -1720,7 +1734,10 @@ async fn commit(
             &snapshot_id,
             &version,
             &next_catalog,
-            &(next_file + files.len() as i64 + i64::from(replacement.is_some())),
+            &(next_file
+                + files.len() as i64
+                + i64::from(replacement.is_some())
+                + i64::from(diff_file.is_some())),
         ],
     )
     .await?;
@@ -1735,18 +1752,24 @@ async fn commit(
          VALUES ($1, $2, $3, $4, NULL)",
         &[
             &snapshot_id,
-            &match (replacement.is_some(), removed + inlined_removed > 0) {
-                (true, true) => {
-                    format!(
-                        "inserted_into_table:{0},deleted_from_table:{0}",
-                        meta.table_id
-                    )
+            &{
+                let mut changes = match (replacement.is_some(), removed + inlined_removed > 0) {
+                    (true, true) => {
+                        format!(
+                            "inserted_into_table:{0},deleted_from_table:{0}",
+                            meta.table_id
+                        )
+                    }
+                    (true, false) => format!("inserted_into_table:{}", meta.table_id),
+                    (false, true) => {
+                        format!("compacted_table:{0},deleted_from_table:{0}", meta.table_id)
+                    }
+                    (false, false) => format!("compacted_table:{}", meta.table_id),
+                };
+                if let Some((meta, _)) = diff_file {
+                    changes.push_str(&format!(",inserted_into_table:{}", meta.table_id));
                 }
-                (true, false) => format!("inserted_into_table:{}", meta.table_id),
-                (false, true) => {
-                    format!("compacted_table:{0},deleted_from_table:{0}", meta.table_id)
-                }
-                (false, false) => format!("compacted_table:{}", meta.table_id),
+                changes
             },
             &job.table.author_for(
                 if replacement.is_some() {
@@ -1831,66 +1854,15 @@ async fn commit(
     }
     let replacement_id = if let Some(file) = replacement {
         let id = next_file + files.len() as i64;
-        let stats_row = tx
-            .query_opt(
-                "SELECT next_row_id FROM ducklake.ducklake_table_stats WHERE table_id = $1",
-                &[&meta.table_id],
-            )
-            .await?;
-        let row_id_start: i64 = stats_row
-            .as_ref()
-            .and_then(|row| row.get::<_, Option<i64>>(0))
-            .unwrap_or(0);
-        tx.execute(
-            "INSERT INTO ducklake.ducklake_data_file
-             (data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path,
-              path_is_relative, file_format, record_count, file_size_bytes, footer_size,
-              row_id_start, partition_id, encryption_key, mapping_id, partial_max)
-             VALUES ($1,$2,$3,NULL,NULL,$4,true,'parquet',$5,$6,$7,$8,NULL,NULL,NULL,NULL)",
-            &[
-                &id,
-                &meta.table_id,
-                &snapshot_id,
-                &file.name,
-                &file.rows,
-                &file.size,
-                &file.footer,
-                &row_id_start,
-            ],
-        )
-        .await?;
-        for stat in &file.stats {
-            tx.execute(
-                "INSERT INTO ducklake.ducklake_file_column_stats
-                 (data_file_id,table_id,column_id,column_size_bytes,value_count,null_count,
-                  min_value,max_value,contains_nan,extra_stats)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL)",
-                &[
-                    &id,
-                    &meta.table_id,
-                    &stat.column_id,
-                    &stat.size_bytes,
-                    &stat.value_count,
-                    &stat.null_count,
-                    &stat.min,
-                    &stat.max,
-                    &stat.contains_nan,
-                ],
-            )
-            .await?;
-        }
-        crate::update_table_stats(
-            &tx,
-            meta.table_id,
-            stats_row.is_some(),
-            row_id_start + file.rows,
-            &file.stats,
-        )
-        .await?;
+        append_file(&tx, meta, snapshot_id, id, file).await?;
         Some(id)
     } else {
         None
     };
+    if let Some((meta, file)) = diff_file {
+        let id = next_file + files.len() as i64 + i64::from(replacement.is_some());
+        append_file(&tx, meta, snapshot_id, id, file).await?;
+    }
     // Deleted rows leave safe, conservative column bounds and do not reuse row IDs.
     if replacement.is_none() {
         let updated = tx
@@ -1917,6 +1889,71 @@ async fn commit(
         inlined_removed,
         removed + inlined_removed,
     ))
+}
+
+async fn append_file(
+    tx: &impl GenericClient,
+    meta: &TableMeta,
+    snapshot_id: i64,
+    id: i64,
+    file: &FileInfo,
+) -> Result<()> {
+    let stats_row = tx
+        .query_opt(
+            "SELECT next_row_id FROM ducklake.ducklake_table_stats WHERE table_id = $1",
+            &[&meta.table_id],
+        )
+        .await?;
+    let row_id_start = stats_row
+        .as_ref()
+        .and_then(|row| row.get::<_, Option<i64>>(0))
+        .unwrap_or(0);
+    tx.execute(
+        "INSERT INTO ducklake.ducklake_data_file
+         (data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path,
+          path_is_relative, file_format, record_count, file_size_bytes, footer_size,
+          row_id_start, partition_id, encryption_key, mapping_id, partial_max)
+         VALUES ($1,$2,$3,NULL,NULL,$4,true,'parquet',$5,$6,$7,$8,NULL,NULL,NULL,NULL)",
+        &[
+            &id,
+            &meta.table_id,
+            &snapshot_id,
+            &file.name,
+            &file.rows,
+            &file.size,
+            &file.footer,
+            &row_id_start,
+        ],
+    )
+    .await?;
+    for stat in &file.stats {
+        tx.execute(
+            "INSERT INTO ducklake.ducklake_file_column_stats
+             (data_file_id,table_id,column_id,column_size_bytes,value_count,null_count,
+              min_value,max_value,contains_nan,extra_stats)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL)",
+            &[
+                &id,
+                &meta.table_id,
+                &stat.column_id,
+                &stat.size_bytes,
+                &stat.value_count,
+                &stat.null_count,
+                &stat.min,
+                &stat.max,
+                &stat.contains_nan,
+            ],
+        )
+        .await?;
+    }
+    crate::update_table_stats(
+        tx,
+        meta.table_id,
+        stats_row.is_some(),
+        row_id_start + file.rows,
+        &file.stats,
+    )
+    .await
 }
 
 pub(crate) async fn replace_window(
@@ -1997,6 +2034,7 @@ pub(crate) async fn replace_window(
                     window,
                     files: &files,
                     replacement: Some(incoming),
+                    diff: None,
                 },
             )
             .await
@@ -2149,6 +2187,7 @@ async fn run(job: &Job) -> Result<()> {
                     window,
                     files: &files,
                     replacement: None,
+                    diff: None,
                 },
             )
             .await

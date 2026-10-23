@@ -335,6 +335,51 @@ window). Commit conflicts are retried automatically. Use Arrow `Date32` for date
 or microsecond timestamps (timezone-aware for `timestamptz`, naive for `timestamp`),
 matching the resolved table's time column.
 
+#### Merge updates and retain changed versions
+
+`Table::merge_diff(batches, "entries_diff")` infers the same window, but merges
+rows by the configured `unique_by_cols` instead of deleting rows absent from the
+input. It requires `unique_by_cols` and `dedup_timestamp`. The diff table must
+already exist with the same column names and types; its DuckLake column IDs may
+differ. An unqualified name uses the target's schema; `"schema.entries_diff"`
+selects another schema in the same catalog.
+
+For each matching key, the row with the latest `dedup_timestamp` wins. Every
+other column is compared with null-safe equality. If any data value differs,
+the older row, including its original timestamp, is appended to the diff table
+via Parquet. Thus older incoming data never rolls back the target, but is still
+archived if its values differ. Unchanged values advance to the newer timestamp
+without adding a diff row. New keys are inserted, and existing keys missing
+from the input are preserved, including gaps inside the inferred window.
+
+Duplicate keys on either side are reduced to that side's latest row before
+comparison. Null keys match null keys; null dedup timestamps are rejected.
+Equal timestamps prefer the existing row, archiving the incoming row only if
+its values differ. History is append-only and is not deduplicated, including
+across repeated calls.
+
+```rust,no_run
+use datafusion::arrow::array::RecordBatch;
+use dkplus::Table;
+
+async fn merge(table: &Table, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
+    let report = table.merge_diff(batches, "entries_diff").await?;
+    println!("snapshot {}: {} target rows, {} history rows",
+        report.target.snapshot_id,
+        report.target.rows,
+        report.diff.as_ref().map_or(0, |diff| diff.rows));
+    Ok(())
+}
+```
+
+The returned `MergeDiffReport` contains a target `LoadReport` and an optional
+diff `LoadReport` (absent when no values changed). Both files are published
+atomically in one snapshot; existing history is never retired. Overlapping
+target files are rewritten to preserve rows outside the window, positional
+deletes are respected, and inlined rows in the window participate in the merge.
+The comparison materializes the input and existing window in memory; boundary
+rewrites use the repack memory budgets.
+
 ### 3. Maintenance: discover and repack
 
 `maintenance::discover` finds complete months whose files look like one file per

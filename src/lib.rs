@@ -46,6 +46,13 @@ pub struct LoadReport {
     pub rewritten_files: Vec<i64>,
 }
 
+#[derive(Debug)]
+pub struct MergeDiffReport {
+    pub target: LoadReport,
+    /// The appended history file, if any values changed.
+    pub diff: Option<LoadReport>,
+}
+
 #[derive(PartialEq)]
 struct Column {
     id: i64,
@@ -879,6 +886,17 @@ fn is_commit_conflict(e: &anyhow::Error) -> bool {
 }
 
 impl Table {
+    /// Merge by unique keys and latest dedup timestamp, archiving changed older rows.
+    /// `diff_table` names an existing, same-schema table in this table's schema,
+    /// or a schema-qualified table. Both writes share one catalog snapshot.
+    pub async fn merge_diff(
+        &self,
+        batches: Vec<RecordBatch>,
+        diff_table: &str,
+    ) -> Result<MergeDiffReport> {
+        repack::merge_diff::run(self, batches, diff_table).await
+    }
+
     fn replacement_bounds(
         &self,
         batches: &[RecordBatch],
