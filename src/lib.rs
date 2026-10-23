@@ -302,10 +302,42 @@ fn overridden_tag<T: serde::de::DeserializeOwned>(
     }
 }
 
-pub(crate) async fn resolve_table(cfg: &Config, builder: TableBuilder) -> Result<Table> {
+async fn column_timezone_tags(
+    c: &impl GenericClient,
+    table_id: i64,
+) -> Result<HashMap<i64, String>> {
+    let rows = c
+        .query(
+            "SELECT tag.column_id, tag.value
+               FROM ducklake.ducklake_column_tag tag
+               CROSS JOIN LATERAL (
+                   SELECT max(snapshot_id) AS snapshot_id
+                     FROM ducklake.ducklake_snapshot
+               ) latest
+              WHERE tag.table_id = $1 AND tag.key = 'dkplus.timezone'
+                AND tag.begin_snapshot <= latest.snapshot_id
+                AND (tag.end_snapshot IS NULL OR tag.end_snapshot > latest.snapshot_id)",
+            &[&table_id],
+        )
+        .await
+        .context("reading active DuckLake column timezone tags")?;
+    let mut tags = HashMap::new();
+    for row in rows {
+        let column_id: i64 = row.get(0);
+        if tags.insert(column_id, row.get(1)).is_some() {
+            bail!("multiple active DuckLake timezone tags for column {column_id}");
+        }
+    }
+    Ok(tags)
+}
+
+pub(crate) async fn resolve_table(builder: TableBuilder) -> Result<Table> {
+    if builder.schema.is_empty() || builder.table.is_empty() || builder.table.contains('.') {
+        bail!("table name must have the form schema.table");
+    }
     identifier(&builder.schema)?;
     identifier(&builder.table)?;
-    let mut client = connect(cfg).await?;
+    let mut client = connect(&builder.cfg).await?;
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
@@ -314,29 +346,40 @@ pub(crate) async fn resolve_table(cfg: &Config, builder: TableBuilder) -> Result
         .await?;
     let meta = table_meta(&tx, &builder.schema, &builder.table).await?;
     let tags = table_tags(&tx, meta.table_id).await?;
+    let column_tags = column_timezone_tags(&tx, meta.table_id).await?;
     tx.commit()
         .await
         .context("finishing table policy read transaction")?;
-    resolve_table_settings(cfg, builder, &meta, &tags)
+    resolve_table_settings(builder, &meta, &tags, &column_tags)
 }
 
 fn resolve_table_settings(
-    cfg: &Config,
     builder: TableBuilder,
     meta: &TableMeta,
     tags: &HashMap<String, String>,
+    column_tags: &HashMap<i64, String>,
 ) -> Result<Table> {
     let time_column = overridden_tag(builder.time_column, tags, TAG_TIME_COLUMN)?
         .context("missing required table setting \"time_column\"")?;
+    let time_col = meta
+        .columns
+        .get(&time_column)
+        .with_context(|| format!("table has no configured time column {time_column:?}"))?;
     let timezone = match builder.timezone {
         Some(timezone) => timezone,
-        None => tag_value::<String>(tags, TAG_TIMEZONE)?
-            .map(|zone| {
-                zone.parse::<chrono_tz::Tz>()
-                    .with_context(|| format!("invalid timezone tag {zone:?}"))
-            })
-            .transpose()?
-            .context("missing required table setting \"timezone\"")?,
+        None => match column_tags.get(&time_col.id) {
+            Some(value) => Some(
+                serde_json::from_str::<String>(value)
+                    .context("decoding DuckLake column tag \"dkplus.timezone\"")?,
+            ),
+            None => tag_value::<String>(tags, TAG_TIMEZONE)?,
+        }
+        .map(|zone| {
+            zone.parse::<chrono_tz::Tz>()
+                .with_context(|| format!("invalid timezone tag {zone:?}"))
+        })
+        .transpose()?
+        .context("missing required table setting \"timezone\"")?,
     };
     let sort_cols = overridden_tag(builder.sort_cols, tags, TAG_SORT_COLS)?
         .context("missing required table setting \"sort_cols\"")?;
@@ -346,13 +389,7 @@ fn resolve_table_settings(
         overridden_tag(builder.unique_by_cols, tags, TAG_UNIQUE_BY_COLS)?.unwrap_or(None);
     let dedup_timestamp =
         overridden_tag(builder.dedup_timestamp, tags, TAG_DEDUP_TIMESTAMP)?.unwrap_or(None);
-    let time_type = match types::arrow_type(
-        &meta
-            .columns
-            .get(&time_column)
-            .with_context(|| format!("table has no configured time column {time_column:?}"))?
-            .ty,
-    )? {
+    let time_type = match types::arrow_type(&time_col.ty)? {
         DataType::Date32 => TimeType::Date,
         DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => TimeType::TimestampTz,
         DataType::Timestamp(TimeUnit::Microsecond, None) => TimeType::Timestamp,
@@ -361,7 +398,7 @@ fn resolve_table_settings(
         }
     };
     let table = Table {
-        cfg: cfg.clone(),
+        cfg: builder.cfg,
         schema: builder.schema,
         table: builder.table.clone(),
         time_column,
@@ -1336,14 +1373,14 @@ mod tests {
             (TAG_DEDUP_TIMESTAMP.into(), "\"fetched_at\"".into()),
         ]);
         let table = resolve_table_settings(
-            &Table::default().cfg,
-            Table::builder("weather", "observations")
+            Table::builder("weather.observations", &Table::default().cfg)
                 .with_time_column("observed")
                 .with_timezone(chrono_tz::UTC)
                 .with_row_group_col("station")
                 .with_lock_namespace("weather.repack"),
             &meta,
             &tags,
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -1360,9 +1397,20 @@ mod tests {
         assert_eq!(table.lock_namespace, "weather.repack");
         assert_eq!(table.author, None);
 
+        let from_column = resolve_table_settings(
+            Table::default()
+                .cfg
+                .table_builder("weather.observations")
+                .with_time_column("observed"),
+            &meta,
+            &tags,
+            &HashMap::from([(1, r#""America/New_York""#.into()), (2, "not-json".into())]),
+        )
+        .unwrap();
+        assert_eq!(from_column.timezone, chrono_tz::America::New_York);
+
         let optional_overrides = resolve_table_settings(
-            &Table::default().cfg,
-            Table::builder("weather", "observations")
+            Table::builder("weather.observations", &Table::default().cfg)
                 .with_time_column("observed")
                 .with_timezone(chrono_tz::UTC)
                 .with_sort_cols(vec!["station".into(), "observed".into()])
@@ -1370,6 +1418,7 @@ mod tests {
                 .without_deduplication(),
             &meta,
             &tags,
+            &HashMap::new(),
         )
         .unwrap();
         assert_eq!(optional_overrides.row_group_col, None);
@@ -1394,9 +1443,9 @@ mod tests {
             columns: HashMap::new(),
         };
         let error = resolve_table_settings(
-            &Table::default().cfg,
-            Table::builder("weather", "observations"),
+            Table::builder("weather.observations", &Table::default().cfg),
             &meta,
+            &HashMap::new(),
             &HashMap::new(),
         )
         .unwrap_err();

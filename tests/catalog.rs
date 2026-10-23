@@ -14,6 +14,8 @@ CREATE TABLE ducklake.ducklake_table (
 CREATE TABLE ducklake.ducklake_metadata (key text, value text, scope text);
 CREATE TABLE ducklake.ducklake_tag (
     object_id bigint, begin_snapshot bigint, end_snapshot bigint, key text, value text);
+CREATE TABLE ducklake.ducklake_column_tag (
+    table_id bigint, column_id bigint, begin_snapshot bigint, end_snapshot bigint, key text, value text);
 CREATE TABLE ducklake.ducklake_partition_info (table_id bigint, end_snapshot bigint);
 CREATE TABLE ducklake.ducklake_column (
     table_id bigint, column_id bigint, column_name text, column_type text, parent_column bigint, end_snapshot bigint);
@@ -103,9 +105,9 @@ async fn expiry_fixture(
         repack_run_bytes: 1,
         repack_node_bytes: 16 * 1024 * 1024,
     };
-    let resolved_table = Table::builder("weather", "observations")
+    let resolved_table = Table::builder("weather.observations", &cfg)
         .with_author("weather-loader")
-        .resolve(&cfg)
+        .resolve()
         .await
         .unwrap();
     let start: NaiveDate = "2026-01-01".parse().unwrap();
@@ -137,6 +139,130 @@ async fn expiry_fixture(
 
 async fn count(client: &tokio_postgres::Client, sql: &str) -> i64 {
     client.query_one(sql, &[]).await.unwrap().get(0)
+}
+
+#[tokio::test]
+#[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+async fn column_timezone_resolves_from_active_metadata_and_can_be_overridden() {
+    let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    client.batch_execute(CATALOG).await.unwrap();
+    client
+        .batch_execute(
+            "INSERT INTO ducklake.ducklake_metadata VALUES ('data_path', 'memory:///', NULL);
+             INSERT INTO ducklake.ducklake_table VALUES (1,1,'observations','observations/',true,NULL);
+             INSERT INTO ducklake.ducklake_column VALUES
+                 (1,1,'observed','timestamptz',NULL,NULL),
+                 (1,2,'fetched','timestamptz',NULL,NULL);
+             INSERT INTO ducklake.ducklake_tag VALUES
+                 (1,0,NULL,'dkplus.time_column','\"observed\"'),
+                 (1,0,NULL,'dkplus.sort_cols','[\"observed\"]'),
+                 (1,0,NULL,'dkplus.timezone','\"UTC\"');
+             INSERT INTO ducklake.ducklake_column_tag VALUES
+                 (1,1,0,0,'dkplus.timezone','\"Not/AZone\"'),
+                 (1,1,1,NULL,'dkplus.timezone','\"Not/AZone\"'),
+                 (1,1,0,NULL,'dkplus.timezone','\"America/New_York\"'),
+                 (1,2,0,NULL,'dkplus.timezone','\"Asia/Tokyo\"'),
+                 (2,1,0,NULL,'dkplus.timezone','\"Not/AZone\"');",
+        )
+        .await
+        .unwrap();
+    let cfg = Config {
+        postgres,
+        ..Table::default().cfg
+    };
+    assert_eq!(
+        cfg.table("weather.observations").await.unwrap().timezone,
+        chrono_tz::America::New_York
+    );
+    client
+        .batch_execute("DELETE FROM ducklake.ducklake_tag WHERE key = 'dkplus.timezone'")
+        .await
+        .unwrap();
+    let resolved = cfg.table("weather.observations").await.unwrap();
+    assert_eq!(resolved.timezone, chrono_tz::America::New_York);
+    let other_column = cfg
+        .table_builder("weather.observations")
+        .with_time_column("fetched")
+        .resolve()
+        .await
+        .unwrap();
+    assert_eq!(other_column.timezone, chrono_tz::Asia::Tokyo);
+    let explicit = Table::builder("weather.observations", &cfg)
+        .with_timezone(chrono_tz::Europe::London)
+        .resolve()
+        .await
+        .unwrap();
+    assert_eq!(explicit.timezone, chrono_tz::Europe::London);
+
+    for value in ["not-json", "\"Not/AZone\"", "null"] {
+        client
+            .execute(
+                "UPDATE ducklake.ducklake_column_tag SET value = $1
+                  WHERE table_id = 1 AND column_id = 1
+                    AND begin_snapshot = 0 AND end_snapshot IS NULL",
+                &[&value],
+            )
+            .await
+            .unwrap();
+        assert!(cfg.table("weather.observations").await.is_err());
+        assert!(
+            cfg.table_builder("weather.observations")
+                .with_timezone(chrono_tz::UTC)
+                .resolve()
+                .await
+                .is_ok()
+        );
+    }
+    client
+        .batch_execute(
+            "INSERT INTO ducklake.ducklake_column_tag VALUES
+                 (1,1,0,NULL,'dkplus.timezone','\"UTC\"');",
+        )
+        .await
+        .unwrap();
+    assert!(
+        cfg.table("weather.observations")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("multiple active")
+    );
+    client
+        .batch_execute(
+            "DELETE FROM ducklake.ducklake_column_tag WHERE table_id = 1 AND column_id = 1",
+        )
+        .await
+        .unwrap();
+    assert!(
+        cfg.table("weather.observations")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("timezone")
+    );
+    client
+        .batch_execute(
+            "INSERT INTO ducklake.ducklake_tag VALUES
+                 (1,0,NULL,'dkplus.timezone','\"UTC\"');",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cfg.table("weather.observations").await.unwrap().timezone,
+        chrono_tz::UTC
+    );
+
+    client
+        .batch_execute("DROP SCHEMA ducklake CASCADE")
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap();
 }
 
 #[tokio::test]
@@ -173,13 +299,14 @@ async fn merge_diff_publishes_both_tables_atomically_and_preserves_unmatched_row
         },
         ..Table::default().cfg
     };
-    let table = Table::builder("weather", "entries")
+    let table = cfg
+        .table_builder("weather.entries")
         .with_time_column("observed")
         .with_timezone(chrono_tz::UTC)
         .with_sort_cols(vec!["node".into(), "observed".into()])
         .with_unique_by_cols(vec!["node".into(), "observed".into()])
         .with_dedup_timestamp("fetched")
-        .resolve(&cfg)
+        .resolve()
         .await
         .unwrap();
     let batch = |rows: &[(i32, &str, Option<i32>, i64)]| {
@@ -505,10 +632,7 @@ async fn table_tag_updates_are_versioned_together_in_one_snapshot() {
         1
     );
 
-    let resolved = Table::builder("weather", "observations")
-        .resolve(&cfg)
-        .await
-        .unwrap();
+    let resolved = cfg.table("weather.observations").await.unwrap();
     assert_eq!(resolved.timezone, chrono_tz::America::Denver);
     assert_eq!(resolved.row_group_col, None);
     assert_eq!(
@@ -1241,14 +1365,14 @@ async fn exercise_catalog(storage: Storage) {
                 .await
                 .unwrap();
         }
-        let resolved_table = Table::builder("weather", &table)
+        let resolved_table = Table::builder(&format!("weather.{table}"), &cfg)
             .with_time_column("observed")
             .with_timezone(chrono_tz::Asia::Tokyo)
             .with_row_group_col("station")
             .with_sort_cols(vec!["station".into(), "observed".into()])
             .with_dedup_timestamp("fetched")
             .with_author("weather-loader")
-            .resolve(&cfg)
+            .resolve()
             .await
             .unwrap();
         let begin = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
@@ -1425,12 +1549,13 @@ async fn exercise_catalog(storage: Storage) {
         } else {
             chrono::Duration::hours(1)
         };
-        let discovery_table_config = Table::builder("weather", &discovery_table)
+        let discovery_table_config = cfg
+            .table_builder(&format!("weather.{discovery_table}"))
             .with_time_column("observed")
             .with_timezone(chrono_tz::Asia::Tokyo)
             .with_sort_cols(vec!["observed".into()])
             .without_row_grouping()
-            .resolve(&cfg)
+            .resolve()
             .await
             .unwrap();
         let candidates = dkplus::maintenance::discover(&cfg, &discovery_table_config, granularity)

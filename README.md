@@ -86,14 +86,14 @@ async fn main() -> anyhow::Result<()> {
         repack_node_bytes: DEFAULT_REPACK_NODE_BYTES,
         log: Arc::new(|message| eprintln!("{message}")),
     };
-    let table = Table::builder("weather", "observations")
-        .with_time_column("observed")
-        .with_timezone(chrono_tz::America::New_York)
-        .with_row_group_col("station")
-        .with_sort_cols(vec!["station".into(), "observed".into()])
-        .with_unique_by_cols(vec!["station".into(), "observed".into()])
-        .with_dedup_timestamp("fetched")
-        .resolve(&cfg)
+    let table = Table::builder("weather.observations", &cfg)
+        .with_time_column("observed") // Optional if DuckLake's dkplus.time_column tag is set.
+        .with_timezone(chrono_tz::America::New_York) // Optional if the column's dkplus.timezone tag is set.
+        .with_row_group_col("station") // Optional if DuckLake's dkplus.row_group_col tag is set.
+        .with_sort_cols(vec!["station".into(), "observed".into()]) // Optional if DuckLake's dkplus.sort_cols tag is set.
+        .with_unique_by_cols(vec!["station".into(), "observed".into()]) // Optional if DuckLake's dkplus.unique_by_cols tag is set.
+        .with_dedup_timestamp("fetched") // Optional if DuckLake's dkplus.dedup_timestamp tag is set.
+        .resolve()
         .await?;
     let begin = "2026-01-01".parse()?;
     let end = "2026-02-01".parse()?;
@@ -164,13 +164,13 @@ async fn build() -> anyhow::Result<Table> {
         repack_node_bytes: DEFAULT_REPACK_NODE_BYTES, // merge-node memory budget
         log: Arc::new(|message| eprintln!("{message}")),
     };
-    let table = Table::builder("weather", "observations")
-        .with_time_column("observed")
-        .with_timezone(chrono_tz::America::New_York)
-        .with_row_group_col("station")
-        .with_sort_cols(vec!["station".into(), "observed".into()])
-        .with_dedup_timestamp("fetched_at")
-        .resolve(&cfg)
+    let table = cfg.table_builder("weather.observations")
+        .with_time_column("observed") // Optional if DuckLake's dkplus.time_column tag is set.
+        .with_timezone(chrono_tz::America::New_York) // Optional if the column's dkplus.timezone tag is set.
+        .with_row_group_col("station") // Optional if DuckLake's dkplus.row_group_col tag is set.
+        .with_sort_cols(vec!["station".into(), "observed".into()]) // Optional if DuckLake's dkplus.sort_cols tag is set.
+        .with_dedup_timestamp("fetched_at") // Optional if DuckLake's dkplus.dedup_timestamp tag is set.
+        .resolve()
         .await?;
     Ok(table)
 }
@@ -186,17 +186,20 @@ async fn build() -> anyhow::Result<Table> {
 | `repack_node_bytes` | Memory budget per merge node (default 256 MiB). |
 | `log` | Shared `Arc<dyn Fn(&str) + Send + Sync>` callback for progress and background errors. Cloned configs/tables share the callback; it may be invoked concurrently. |
 
-`Table::builder(schema, table)` resolves a table's policy from explicit builder
-values and active DuckLake table tags. Explicit values override tags. Required
+`Table::builder("schema.table", &cfg)` and `cfg.table_builder("schema.table")`
+return the same builder, which retains a cloned config. Call `.resolve().await?`
+to resolve policy from explicit values and active DuckLake table/column tags.
+Use `cfg.table("schema.table").await?` to resolve using only DuckLake metadata,
+without any overrides. Explicit values override tags. Required
 settings left unresolved by both sources fail with an error.
 Resolve a builder when starting an operation to pick up the latest committed
 tags. `with_*` values are per-table overrides and do not write tags back to
-DuckLake; use `Table::update_tags` to persist changes.
+DuckLake; use `Table::update_tags` to persist table-level changes.
 
 | Setting | Meaning |
 |---|---|
 | `time_column` | Required window column; its `date`, `timestamp`, or `timestamptz` type is inferred from the catalog. |
-| `timezone` | Required zone for resolving repack date boundaries on `timestamptz` tables. It is not inferable from `timestamptz`, which stores instants, not a named zone. |
+| `timezone` | Target IANA zone, supplied explicitly or by the time column's `dkplus.timezone` tag (with the table tag as a legacy fallback). Required even for naive/date tables, where boundaries remain wall-clock values. It is not inferable from `timestamptz`, which stores instants, not a named zone. |
 | `row_group_col` | Optional grouping column; must lead `sort_cols`. Missing/`null` means no row grouping. |
 | `sort_cols` | Required ascending sort order of repacked files. |
 | `unique_by_cols` | Optional columns defining duplicates; missing/`null` disables deduplication. |
@@ -204,13 +207,17 @@ DuckLake; use `Table::update_tags` to persist changes.
 | `lock_namespace` | Optional explicit lock namespace; defaults to the table name. |
 | `author` | Optional snapshot author override; defaults to an operation/window-derived value. |
 
-The recognized settings are table-level entries in DuckLake's `ducklake_tag` table.
+The recognized settings are table-level entries in DuckLake's `ducklake_tag` table,
+except that `dkplus.timezone` should be set on the time column in
+`ducklake_column_tag` (`table_id`, `column_id`, `begin_snapshot`, `end_snapshot`,
+`key`, `value`). The column tag takes precedence over the legacy table-level
+timezone tag; an explicit `with_timezone` overrides both.
 The `key` identifies the setting, and `value` is a string containing JSON:
 
 | Tag key | JSON value example | How dkplus uses it |
 |---|---|---|
 | `dkplus.time_column` | `"observed"` | Required column defining repack windows. Its catalog type determines whether boundaries are dates or timestamps. |
-| `dkplus.timezone` | `"America/New_York"` | Required IANA time zone for resolving boundaries when the time column is `timestamptz`. |
+| `dkplus.timezone` | `"America/New_York"` | Time-column tag defining the target IANA time zone for repack boundaries; a table-level tag remains supported as a fallback. |
 | `dkplus.row_group_col` | `"station"` or `null` | Optional row-group key. When set, it must be the first column in `dkplus.sort_cols`. |
 | `dkplus.sort_cols` | `["station", "observed"]` | Required ascending sort order for repacked files. |
 | `dkplus.unique_by_cols` | `["station", "observed"]` or `null` | Optional duplicate key. When set, dkplus keeps the row selected using `dkplus.dedup_timestamp`. |
@@ -221,12 +228,16 @@ could be:
 
 ```text
 dkplus.time_column      = "observed"
-dkplus.timezone         = "America/New_York"
 dkplus.row_group_col    = "station"
 dkplus.sort_cols        = ["station", "observed"]
 dkplus.unique_by_cols   = ["station", "observed"]
 dkplus.dedup_timestamp  = "fetched_at"
 ```
+
+On the `observed` column, set `dkplus.timezone = "America/New_York"` in
+`ducklake_column_tag`, with the value encoded as a JSON string just like table
+tags. Only tags active at the latest snapshot are used. Duplicate active timezone
+tags for a column, malformed JSON, and invalid IANA zones fail explicitly.
 
 List values are JSON arrays; nullable optional values can be JSON `null` (for
 example, `dkplus.row_group_col = null` disables row grouping). Missing optional
@@ -519,11 +530,11 @@ or device ID). You pick it once, in the `Table`, and it must also be the first o
 
 ```rust,no_run
 async fn configure(cfg: &dkplus::Config) -> anyhow::Result<()> {
-    let _layout = dkplus::Table::builder("weather", "observations")
-        .with_timezone(chrono_tz::UTC)
-        .with_row_group_col("station")
-        .with_sort_cols(vec!["station".into(), "observed".into()])
-        .resolve(cfg)
+    let _layout = dkplus::Table::builder("weather.observations", cfg)
+        .with_timezone(chrono_tz::UTC) // Optional if the column's dkplus.timezone tag is set.
+        .with_row_group_col("station") // Optional if DuckLake's dkplus.row_group_col tag is set.
+        .with_sort_cols(vec!["station".into(), "observed".into()]) // Optional if DuckLake's dkplus.sort_cols tag is set.
+        .resolve()
         .await?;
     Ok(())
 }

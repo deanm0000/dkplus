@@ -110,6 +110,17 @@ pub struct Config {
 
 pub type Log = Arc<dyn Fn(&str) + Send + Sync>;
 
+impl Config {
+    /// Resolve a table using its active DuckLake metadata and tags.
+    pub async fn table(&self, name: &str) -> Result<Table> {
+        self.table_builder(name).resolve().await
+    }
+
+    pub fn table_builder(&self, name: &str) -> TableBuilder {
+        Table::builder(name, self)
+    }
+}
+
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
@@ -192,6 +203,7 @@ impl std::fmt::Display for Table {
 /// Builder for resolving table policy from explicit values and DuckLake tags.
 #[derive(Debug, Clone)]
 pub struct TableBuilder {
+    pub(crate) cfg: Config,
     pub(crate) schema: String,
     pub(crate) table: String,
     pub(crate) time_column: Option<String>,
@@ -205,14 +217,17 @@ pub struct TableBuilder {
 }
 
 impl Table {
-    pub fn builder(schema: impl Into<String>, table: impl Into<String>) -> TableBuilder {
-        TableBuilder::new(schema, table)
+    /// Build policy for a qualified `schema.table` name using a cloned config.
+    pub fn builder(name: &str, cfg: &Config) -> TableBuilder {
+        TableBuilder::new(name, cfg)
     }
 }
 
 impl TableBuilder {
-    pub fn new(schema: impl Into<String>, table: impl Into<String>) -> Self {
+    pub fn new(name: &str, cfg: &Config) -> Self {
+        let (schema, table) = name.split_once('.').unwrap_or(("", name));
         Self {
+            cfg: cfg.clone(),
             schema: schema.into(),
             table: table.into(),
             time_column: None,
@@ -277,8 +292,8 @@ impl TableBuilder {
         self
     }
 
-    pub async fn resolve(self, cfg: &Config) -> Result<Table> {
-        crate::resolve_table(cfg, self).await
+    pub async fn resolve(self) -> Result<Table> {
+        crate::resolve_table(self).await
     }
 }
 
@@ -372,6 +387,29 @@ pub(crate) fn identifier(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builders_retain_their_config() {
+        let mut cfg = Table::default().cfg;
+        cfg.repack_run_bytes = 42;
+        let direct = Table::builder("weather.observations", &cfg);
+        let from_config = cfg.table_builder("weather.observations");
+        cfg.repack_run_bytes = 99;
+        for builder in [direct, from_config] {
+            assert_eq!(builder.schema, "weather");
+            assert_eq!(builder.table, "observations");
+            assert_eq!(builder.cfg.repack_run_bytes, 42);
+            assert!(Arc::ptr_eq(&builder.cfg.log, &cfg.log));
+        }
+    }
+
+    #[tokio::test]
+    async fn builders_reject_unqualified_or_invalid_names_before_connecting() {
+        let cfg = Table::default().cfg;
+        for name in ["observations", ".observations", "weather.", "a.b.c", "a.\0"] {
+            assert!(cfg.table(name).await.is_err(), "{name:?}");
+        }
+    }
 
     #[test]
     fn midnight_domains_preserve_dst_and_wall_clock_dates() {
