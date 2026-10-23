@@ -264,7 +264,7 @@ Use dkplus's `Table::update_tags` method rather than editing `ducklake_tag`
 rows directly; it versions the changes and groups them into one snapshot.
 
 The Python SDK and DuckDB extension do not currently provide arbitrary tag
-writes. Use the Rust API:
+writes. Use this crate's API:
 
 ```rust,no_run
 use std::collections::HashMap;
