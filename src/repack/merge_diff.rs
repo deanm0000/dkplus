@@ -53,22 +53,20 @@ pub(crate) async fn run(
         TimeType::TimestampTz => time.with_timezone(&table.timezone).date_naive(),
         _ => time.date_naive(),
     };
-    let job = Job {
-        table: table.clone(),
-        begin_date: date(start),
-        end_date: date(last)
-            .succ_opt()
-            .context("merge window end out of range")?,
-        unique: None,
-        files: None,
-        expire_snapshot: ExpireSnapshot::Never,
-    };
+    let job = table
+        .repack(
+            date(start),
+            date(last)
+                .succ_opt()
+                .context("merge window end out of range")?,
+        )?
+        .with_expire_snapshot(ExpireSnapshot::Never);
     job.validate()?;
     if table.cfg.repack_run_bytes == 0 || table.cfg.repack_node_bytes == 0 {
         bail!("repack memory budgets must be positive");
     }
     let mut client = connect(&table.cfg).await?;
-    lock_range(&client, &job).await?;
+    lock_range(&client, &job, Window::for_job(&job)?).await?;
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)

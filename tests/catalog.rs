@@ -133,6 +133,7 @@ async fn expiry_fixture(
     let loaded = resolved_table.replace_window(vec![batch]).await.unwrap();
     let job = resolved_table
         .repack(start, end)
+        .unwrap()
         .with_expire_snapshot(dkplus::repack::ExpireSnapshot::Never);
     (cfg, job, loaded)
 }
@@ -560,6 +561,234 @@ async fn merge_diff_publishes_both_tables_atomically_and_preserves_unmatched_row
 
 #[tokio::test]
 #[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+async fn cli_policy_updates_are_validated_and_atomic_across_tables() {
+    let connection_string = std::env::var("DKPLUS_TEST_DATABASE_URL").unwrap();
+    let postgres: tokio_postgres::Config = connection_string.parse().unwrap();
+    let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    client.batch_execute(CATALOG).await.unwrap();
+    client
+        .batch_execute(
+            "INSERT INTO ducklake.ducklake_table VALUES
+             (1,1,'observations','observations/',true,NULL),
+             (2,1,'forecast','forecast/',true,NULL),
+             (3,1,'dates','dates/',true,NULL);
+         INSERT INTO ducklake.ducklake_column VALUES
+             (1,1,'observed','timestamptz',NULL,NULL),
+             (1,2,'station','int32',NULL,NULL),
+             (1,3,'fetched','timestamp',NULL,NULL),
+             (2,1,'observed','timestamptz',NULL,NULL),
+             (2,2,'station','int32',NULL,NULL),
+             (3,1,'observed','date',NULL,NULL);
+         INSERT INTO ducklake.ducklake_tag VALUES
+             (1,0,NULL,'dkplus.timezone','\"UTC\"');",
+        )
+        .await
+        .unwrap();
+
+    let inline = std::process::Command::new(env!("CARGO_BIN_EXE_dkplus"))
+        .args([
+            &connection_string,
+            "weather.observations",
+            "time_column",
+            "observed",
+            "row_group_col",
+            "station",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        inline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inline.stderr)
+    );
+    assert!(String::from_utf8_lossy(&inline.stdout).contains("snapshot 1"));
+
+    let values = serde_json::json!({
+        "weather.observations": {
+            "timezone": "America/Denver", "granularity": "5 minutes",
+            "sort_cols": ["station", "observed"], "unique_by_cols": ["station", "observed"],
+            "dedup_timestamp": "fetched", "repack_level1_age_min": "1 day",
+            "repack_level1_calendar_begin": "day"
+        },
+        "weather.forecast": {
+            "time_column": "observed", "timezone": "UTC", "granularity": "unpredictable",
+            "sort_cols": ["observed"]
+        }
+    });
+    let file = std::env::temp_dir().join(format!("dkplus-policy-{}.json", uuid::Uuid::now_v7()));
+    std::fs::write(&file, serde_json::to_vec(&values).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dkplus"))
+        .args([&connection_string, "--file", file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    std::fs::remove_file(file).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("snapshot 2"));
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM ducklake.ducklake_snapshot").await,
+        3
+    );
+    let summary: String = client
+        .query_one(
+            "SELECT changes_made FROM ducklake.ducklake_snapshot_changes WHERE snapshot_id=2",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(summary, "altered_table:1,altered_table:2");
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.ducklake_column_tag
+          WHERE begin_snapshot=2 AND end_snapshot IS NULL"
+        )
+        .await,
+        4
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.ducklake_tag
+          WHERE key='dkplus.timezone' AND begin_snapshot=0 AND end_snapshot IS NULL"
+        )
+        .await,
+        1
+    );
+    client
+        .execute(
+            "INSERT INTO ducklake.ducklake_metadata VALUES ('data_path', 'memory:///', NULL)",
+            &[],
+        )
+        .await
+        .unwrap();
+    let cfg = Config {
+        postgres: postgres.clone(),
+        ..Table::default().cfg
+    };
+    let resolved = cfg.table("weather.observations").await.unwrap();
+    assert_eq!(resolved.timezone, chrono_tz::America::Denver);
+    assert_eq!(
+        resolved.granularity,
+        Some(dkplus::maintenance::Granularity::Fixed(
+            dkplus::maintenance::Interval::minutes(5)
+        ))
+    );
+    assert_eq!(
+        dkplus::tags::update(&postgres, serde_json::from_value(values).unwrap())
+            .await
+            .unwrap(),
+        2
+    );
+
+    for invalid in [
+        serde_json::json!({"weather.forecast": {"row_group_col": "missing"}}),
+        serde_json::json!({"weather.forecast": {"sort_cols": ["missing"]}}),
+        serde_json::json!({"weather.forecast": {"unique_by_cols": ["missing"], "dedup_timestamp": "observed"}}),
+        serde_json::json!({"weather.forecast": {"dedup_timestamp": "station"}}),
+        serde_json::json!({"weather.forecast": {"time_column": "station"}}),
+        serde_json::json!({"weather.forecast": {"timezone": "Mars/Olympus"}}),
+        serde_json::json!({"weather.forecast": {"granularity": "not an interval"}}),
+        serde_json::json!({"weather.forecast": {"granularity": "0 seconds"}}),
+        serde_json::json!({"weather.forecast": {"granularity": "-1 day"}}),
+        serde_json::json!({"weather.forecast": {"repack_level1_age_min": "-1 day"}}),
+        serde_json::json!({"weather.forecast": {"repack_level1_calendar_begin": "fortnight"}}),
+        serde_json::json!({"weather.observations": {"sort_cols": ["observed", "station"]}}),
+        serde_json::json!({"weather.dates": {"time_column": "observed", "granularity": "1 hour"}}),
+        serde_json::json!({"weather.dates": {"timezone": "UTC"}}),
+        serde_json::json!({"weather.observations": {"timezone": "UTC"}, "weather.zzmissing": {"time_column": "observed"}}),
+    ] {
+        let error =
+            dkplus::tags::update(&postgres, serde_json::from_value(invalid.clone()).unwrap())
+                .await
+                .unwrap_err();
+        assert!(!error.to_string().is_empty(), "{invalid}");
+        assert_eq!(
+            count(
+                &client,
+                "SELECT max(snapshot_id) FROM ducklake.ducklake_snapshot"
+            )
+            .await,
+            2,
+            "{invalid}"
+        );
+        assert_eq!(
+            count(&client, "SELECT count(*) FROM ducklake.ducklake_column_tag").await,
+            4,
+            "{invalid}"
+        );
+    }
+    let updates = serde_json::json!({
+        "weather.observations": {"timezone": "UTC", "row_group_col": null},
+        "weather.dates": {"time_column": "observed", "granularity": "1 day"}
+    });
+    assert_eq!(
+        dkplus::tags::update(&postgres, serde_json::from_value(updates).unwrap())
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.ducklake_column_tag
+          WHERE table_id=1 AND key='dkplus.timezone' AND begin_snapshot=2 AND end_snapshot=3"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.ducklake_snapshot_changes WHERE snapshot_id=3"
+        )
+        .await,
+        1
+    );
+    let updates = serde_json::json!({
+        "weather.observations": {
+            "time_column": "fetched", "timezone": "UTC", "granularity": "1 hour"
+        }
+    });
+    assert_eq!(
+        dkplus::tags::update(&postgres, serde_json::from_value(updates).unwrap())
+            .await
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.ducklake_column_tag
+          WHERE table_id=1 AND column_id=3 AND begin_snapshot=4 AND end_snapshot IS NULL"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.ducklake_column_tag
+          WHERE table_id=1 AND column_id=1 AND end_snapshot IS NULL"
+        )
+        .await,
+        2
+    );
+    client
+        .batch_execute("DROP SCHEMA ducklake CASCADE")
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
 async fn table_tag_updates_are_versioned_together_in_one_snapshot() {
     let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
         .unwrap()
@@ -781,6 +1010,7 @@ async fn replacement_rewrites_straddling_files_and_versions_inlined_rows() {
     let end: NaiveDate = "2026-02-01".parse().unwrap();
     table
         .repack(begin, end)
+        .unwrap()
         .with_expire_snapshot(dkplus::repack::ExpireSnapshot::Never)
         .run()
         .await
@@ -841,6 +1071,305 @@ async fn replacement_rewrites_straddling_files_and_versions_inlined_rows() {
 
 #[tokio::test]
 #[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+async fn potential_repacks_run_with_strictness() {
+    use dkplus::maintenance::{
+        CalendarUnit, Granularity, Interval, RepackLevel, RepackOutcome, do_repack,
+    };
+    use dkplus::repack::{Bound, Strictness};
+
+    let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    let (_, job, first) = expiry_fixture(&client, &postgres).await;
+    let mut table = job.table;
+    table.granularity = Some(Granularity::Fixed(Interval::days(1)));
+    table.repack_levels = vec![RepackLevel {
+        targetwindow_min: Some(Interval::days(2)),
+        targetwindow_max: Some(Interval::days(2)),
+        calendar_begin: Some(CalendarUnit::Day),
+        ..RepackLevel::new(1)
+    }];
+    let batch = |date: &str| {
+        let day = date
+            .parse::<NaiveDate>()
+            .unwrap()
+            .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+            .num_days();
+        RecordBatch::try_from_iter([
+            (
+                "observed",
+                Arc::new(Date32Array::from(vec![i32::try_from(day).unwrap()])) as ArrayRef,
+            ),
+            ("station", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+            (
+                "fetched",
+                Arc::new(TimestampMicrosecondArray::from(vec![10])) as ArrayRef,
+            ),
+        ])
+        .unwrap()
+    };
+    let second = table
+        .replace_window(vec![batch("2026-01-02")])
+        .await
+        .unwrap();
+    let later = table
+        .replace_window(vec![batch("2026-01-05")])
+        .await
+        .unwrap();
+    let current = "SELECT count(*) FROM ducklake.ducklake_data_file WHERE end_snapshot IS NULL";
+    assert_eq!(count(&client, current).await, 3);
+
+    let repacks = table.find_potential_repacks().await.unwrap();
+    assert_eq!(repacks.len(), 1, "{repacks:?}");
+    let repack = repacks.into_iter().next().unwrap();
+    let midnight = |date: &str| Bound::Naive(format!("{date}T00:00:00").parse().unwrap());
+    assert_eq!(
+        (repack.begin, repack.end),
+        (midnight("2026-01-01"), midnight("2026-01-03"))
+    );
+    // Plans carry catalog paths, which are relative to the table directory.
+    let name = |path: &str| path.rsplit('/').next().unwrap().to_string();
+    assert_eq!(repack.files, [name(&first.path), name(&second.path)]);
+
+    let mut stale = repack.clone();
+    stale.files[1] = "missing.parquet".into();
+    assert!(matches!(
+        do_repack(&table, &stale, Strictness::Raise).await.unwrap(),
+        RepackOutcome::Skipped(reason) if reason.contains("missing.parquet")
+    ));
+
+    // Simulate another writer's file whose rows straddle the planned window.
+    client
+        .execute(
+            "UPDATE ducklake.ducklake_file_column_stats SET min_value = '2026-01-02'
+              WHERE data_file_id = $1 AND column_id = 1",
+            &[&later.data_file_id],
+        )
+        .await
+        .unwrap();
+    assert!(table.find_potential_repacks().await.unwrap().is_empty());
+    let error = do_repack(&table, &repack, Strictness::Raise)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("outside the window"),
+        "{error:#}"
+    );
+    assert_eq!(count(&client, current).await, 3);
+
+    assert_eq!(
+        do_repack(&table, &repack, Strictness::Mash).await.unwrap(),
+        RepackOutcome::Repacked
+    );
+    assert_eq!(count(&client, current).await, 1);
+    assert_eq!(
+        count(
+            &client,
+            "SELECT record_count FROM ducklake.ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await,
+        5
+    );
+    // Once the plan's files are retired, rerunning is a no-op skip.
+    assert!(matches!(
+        do_repack(&table, &repack, Strictness::Mash).await.unwrap(),
+        RepackOutcome::Skipped(_)
+    ));
+
+    client
+        .batch_execute("DROP SCHEMA ducklake CASCADE")
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+async fn maintenance_repack_expires_referencing_snapshots_for_cleanup() {
+    use dkplus::maintenance::{
+        CalendarUnit, CleanupOptions, CleanupScope, Granularity, Interval, PotentialRepack,
+        RepackLevel, RepackOutcome, cleanup_expired_files, do_repack,
+    };
+    use dkplus::repack::Strictness;
+    use object_store::path::Path;
+
+    let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    for dedup in [false, true] {
+        let (cfg, job, first) = expiry_fixture(&client, &postgres).await;
+        let mut table = job.table;
+        if dedup {
+            table.unique_by_cols = Some(vec!["station".into(), "observed".into()]);
+        }
+        table.granularity = Some(Granularity::Fixed(Interval::days(1)));
+        table.repack_levels = vec![RepackLevel {
+            targetwindow_min: Some(Interval::days(2)),
+            targetwindow_max: Some(Interval::days(2)),
+            calendar_begin: Some(CalendarUnit::Day),
+            ..RepackLevel::new(1)
+        }];
+        let day = NaiveDate::from_ymd_opt(2026, 1, 2)
+            .unwrap()
+            .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+            .num_days() as i32;
+        let batch = |day| {
+            RecordBatch::try_from_iter([
+                (
+                    "observed",
+                    Arc::new(Date32Array::from(vec![day; 3])) as ArrayRef,
+                ),
+                (
+                    "station",
+                    Arc::new(Int32Array::from(vec![1; 3])) as ArrayRef,
+                ),
+                (
+                    "fetched",
+                    Arc::new(TimestampMicrosecondArray::from(vec![1, 2, 3])) as ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let selected = table.replace_window(vec![batch(day)]).await.unwrap();
+        let next = table.replace_window(vec![batch(day + 1)]).await.unwrap();
+        client
+            .batch_execute(
+                "INSERT INTO ducklake.ducklake_table VALUES (2,1,'other','other/',true,NULL);
+             INSERT INTO ducklake.ducklake_snapshot
+             SELECT id,now(),schema_version,next_catalog_id,next_file_id
+             FROM ducklake.ducklake_snapshot CROSS JOIN (VALUES (4),(5)) AS ids(id)
+             WHERE snapshot_id=3;
+             INSERT INTO ducklake.ducklake_snapshot_changes
+             VALUES (4,'inserted_into_table:2','other',NULL,NULL),
+                    (5,'inserted_into_table:2','other',NULL,NULL);
+             INSERT INTO ducklake.ducklake_data_file
+             (data_file_id,table_id,begin_snapshot,path,path_is_relative)
+             VALUES (100,2,4,'other.parquet',true);",
+            )
+            .await
+            .unwrap();
+        let window = table
+            .repack("2026-01-02".parse().unwrap(), "2026-01-04".parse().unwrap())
+            .unwrap();
+        let repack = PotentialRepack {
+            table: table.to_string(),
+            level: table.repack_levels[0].clone(),
+            granularity: table.granularity.unwrap(),
+            begin: window.begin,
+            end: window.end,
+            files: [&selected.path, &next.path]
+                .map(|path| path.rsplit('/').next().unwrap().to_owned())
+                .to_vec(),
+        };
+        let before = Utc::now();
+        assert_eq!(
+            do_repack(&table, &repack, Strictness::Raise).await.unwrap(),
+            RepackOutcome::Repacked
+        );
+        let snapshots: Vec<i64> = client
+            .query(
+                "SELECT snapshot_id FROM ducklake.ducklake_snapshot ORDER BY snapshot_id",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(snapshots, [0, 1, 6]);
+        assert_eq!(
+            count(
+                &client,
+                "SELECT count(*) FROM ducklake.ducklake_snapshot_changes"
+            )
+            .await,
+            6
+        );
+        assert_eq!(
+            count(&client, "SELECT count(*) FROM ducklake.ducklake_data_file WHERE data_file_id=100 AND end_snapshot IS NULL").await,
+            1
+        );
+        assert_eq!(
+            count(
+                &client,
+                "SELECT record_count FROM ducklake.ducklake_table_stats WHERE table_id=1"
+            )
+            .await,
+            if dedup { 5 } else { 9 }
+        );
+        let scheduled: chrono::DateTime<Utc> = client
+            .query_one(
+                "SELECT schedule_start FROM ducklake.ducklake_files_scheduled_for_deletion WHERE data_file_id=$1",
+                &[&selected.data_file_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let mut options = CleanupOptions {
+            scope: CleanupScope::Table {
+                schema: table.schema.clone(),
+                table: table.table.clone(),
+            },
+            older_than: before,
+            dry_run: false,
+        };
+        assert!(
+            cleanup_expired_files(&cfg, &options)
+                .await
+                .unwrap()
+                .files
+                .is_empty()
+        );
+        options.older_than = scheduled;
+        assert!(
+            cleanup_expired_files(&cfg, &options)
+                .await
+                .unwrap()
+                .files
+                .is_empty()
+        );
+        options.older_than = Utc::now();
+        options.dry_run = true;
+        let preview = cleanup_expired_files(&cfg, &options).await.unwrap();
+        assert_eq!(preview.files.len(), 2);
+        assert!(preview.files.iter().any(|file| file.path == selected.path));
+        assert!(preview.files.iter().any(|file| file.path == next.path));
+        let (store, key) = cfg.storage.resolve(&selected.path).unwrap();
+        assert!(store.head(&Path::from(key.clone())).await.is_ok());
+        options.dry_run = false;
+        let report = cleanup_expired_files(&cfg, &options).await.unwrap();
+        assert_eq!(report.deleted, 2);
+        assert!(store.head(&Path::from(key)).await.is_err());
+        let (_, next_key) = cfg.storage.resolve(&next.path).unwrap();
+        assert!(store.head(&Path::from(next_key)).await.is_err());
+        let (_, first_key) = cfg.storage.resolve(&first.path).unwrap();
+        assert!(store.head(&Path::from(first_key)).await.is_ok());
+        assert!(matches!(
+            do_repack(&table, &repack, Strictness::Raise).await.unwrap(),
+            RepackOutcome::Skipped(_)
+        ));
+        assert_eq!(
+            count(&client, "SELECT count(*) FROM ducklake.ducklake_snapshot").await,
+            3
+        );
+        client
+            .batch_execute("DROP SCHEMA ducklake CASCADE")
+            .await
+            .unwrap();
+    }
+    drop(client);
+    connection.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
 async fn repack_expiry_policies_retention_and_atomicity() {
     use dkplus::maintenance::{CleanupOptions, CleanupScope, cleanup_expired_files};
     use dkplus::repack::ExpireSnapshot;
@@ -853,6 +1382,7 @@ async fn repack_expiry_policies_retention_and_atomicity() {
     let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
     let connection = tokio::spawn(async move { connection.await.unwrap() });
     for policy in [
+        ExpireSnapshot::Referencing,
         ExpireSnapshot::Never,
         ExpireSnapshot::IfNoDedup,
         ExpireSnapshot::Always,
@@ -867,8 +1397,9 @@ async fn repack_expiry_policies_retention_and_atomicity() {
                 if external {
                     job.table.row_group_col = None;
                 }
-                let expires = policy == ExpireSnapshot::Always
-                    || (policy == ExpireSnapshot::IfNoDedup && !dedup);
+                let expires =
+                    matches!(policy, ExpireSnapshot::Always | ExpireSnapshot::Referencing)
+                        || (policy == ExpireSnapshot::IfNoDedup && !dedup);
                 let mut log = Vec::new();
                 run(&cfg, &job, &mut log).await.unwrap();
                 assert_eq!(
@@ -914,7 +1445,11 @@ async fn repack_expiry_policies_retention_and_atomicity() {
                 );
                 assert_eq!(
                     log.iter()
-                        .any(|s| s.contains("expired predecessor snapshot 1")),
+                        .any(|s| s.contains(if policy == ExpireSnapshot::Referencing {
+                            "expired snapshots referencing replaced files"
+                        } else {
+                            "expired predecessor snapshot 1"
+                        })),
                     expires
                 );
                 let (store, key) = cfg.storage.resolve(&loaded.path).unwrap();
@@ -1114,7 +1649,7 @@ async fn repack_expiry_policies_retention_and_atomicity() {
     // Expiry also retires positional-delete metadata, including old delete
     // versions whose parent data file is no longer referenced.
     let (cfg, mut job, loaded) = expiry_fixture(&client, &postgres).await;
-    job.expire_snapshot = ExpireSnapshot::Always;
+    job.expire_snapshot = ExpireSnapshot::Referencing;
     let (store, _) = cfg.storage.resolve(&loaded.path).unwrap();
     for name in ["current-delete.parquet", "historical-delete.parquet"] {
         let path = Path::from(format!("weather/observations/{name}"));
@@ -1198,7 +1733,7 @@ async fn repack_expiry_policies_retention_and_atomicity() {
 
     // A queueing failure must roll back the new snapshot AND expiry.
     let (cfg, mut job, _) = expiry_fixture(&client, &postgres).await;
-    job.expire_snapshot = ExpireSnapshot::Always;
+    job.expire_snapshot = ExpireSnapshot::Referencing;
     client
         .batch_execute(
             "CREATE FUNCTION ducklake.fail_queue() RETURNS trigger LANGUAGE plpgsql AS
@@ -1246,8 +1781,13 @@ async fn repack_expiry_policies_retention_and_atomicity() {
     job.files = Some(vec![]);
     run(&cfg, &job, &mut Vec::new()).await.unwrap();
     job.files = None;
-    job.begin_date = "2030-01-01".parse().unwrap();
-    job.end_date = "2030-02-01".parse().unwrap();
+    let empty = job
+        .table
+        .repack("2030-01-01".parse().unwrap(), "2030-02-01".parse().unwrap());
+    (job.begin, job.end) = {
+        let empty = empty.unwrap();
+        (empty.begin, empty.end)
+    };
     run(&cfg, &job, &mut Vec::new()).await.unwrap();
     assert_eq!(
         count(
@@ -1451,6 +1991,7 @@ async fn exercise_catalog(storage: Storage) {
         }
         let job = resolved_table
             .repack(begin, end)
+            .unwrap()
             .with_unique(vec!["station".into(), "observed".into()])
             .with_expire_snapshot(dkplus::repack::ExpireSnapshot::Never);
         let mut log = Vec::new();
@@ -1545,26 +2086,86 @@ async fn exercise_catalog(storage: Storage) {
                 &[&file_id, &discovery_id, &min, &max]).await.unwrap();
         }
         let granularity = if kind == TimeType::Date {
-            chrono::Duration::days(1)
+            "1 day"
         } else {
-            chrono::Duration::hours(1)
+            "1 hour"
         };
+        for (key, value) in [
+            ("dkplus.time_column", r#""observed""#),
+            ("dkplus.timezone", r#""Asia/Tokyo""#),
+            ("dkplus.sort_cols", r#"["observed"]"#),
+            ("dkplus.repack_level1_targetwindow_min", r#""1 month""#),
+            ("dkplus.repack_level1_targetwindow_max", r#""1 month""#),
+            ("dkplus.repack_level1_calendar_begin", r#""month""#),
+            // Week groups overlap the month and are dropped by cross-level dedup.
+            ("dkplus.repack_level2_targetwindow_max", r#""7 days""#),
+            ("dkplus.repack_level2_calendar_begin", r#""day""#),
+            // Age rules need a dedup timestamp, so this level is skipped.
+            ("dkplus.repack_level3_age_min", r#""1 day""#),
+        ] {
+            client
+                .execute(
+                    "INSERT INTO ducklake.ducklake_tag VALUES ($1,0,NULL,$2,$3)",
+                    &[&discovery_id, &key, &value],
+                )
+                .await
+                .unwrap();
+        }
+        client
+            .execute(
+                "INSERT INTO ducklake.ducklake_column_tag VALUES ($1,1,0,NULL,'dkplus.granularity',$2)",
+                &[&discovery_id, &format!("{granularity:?}")],
+            )
+            .await
+            .unwrap();
         let discovery_table_config = cfg
             .table_builder(&format!("weather.{discovery_table}"))
-            .with_time_column("observed")
-            .with_timezone(chrono_tz::Asia::Tokyo)
-            .with_sort_cols(vec!["observed".into()])
-            .without_row_grouping()
             .resolve()
             .await
             .unwrap();
-        let candidates = dkplus::maintenance::discover(&cfg, &discovery_table_config, granularity)
+        assert_eq!(discovery_table_config.repack_levels.len(), 3);
+        let repacks = discovery_table_config
+            .find_potential_repacks()
             .await
             .unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].files.len(), 31);
-        assert_eq!(candidates[0].begin.date(), begin);
-        assert_eq!(candidates[0].end.date(), end.pred_opt().unwrap());
+        assert_eq!(repacks.len(), 1, "{repacks:?}");
+        assert_eq!(repacks[0].level.level, 1);
+        assert_eq!(repacks[0].files.len(), 31);
+        let expected = |date: NaiveDate| match kind {
+            TimeType::TimestampTz => dkplus::repack::Bound::Tz(
+                chrono_tz::Asia::Tokyo
+                    .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            _ => dkplus::repack::Bound::Naive(date.and_hms_opt(0, 0, 0).unwrap()),
+        };
+        assert_eq!(repacks[0].begin, expected(begin));
+        assert_eq!(repacks[0].end, expected(end));
+        let encoded = serde_json::to_string(&repacks[0]).unwrap();
+        let decoded: dkplus::maintenance::PotentialRepack = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, repacks[0]);
+        // Without the first day, no full month remains; days 2-8 form a week.
+        client
+            .execute(
+                "UPDATE ducklake.ducklake_data_file SET end_snapshot = 0
+                  WHERE table_id = $1 AND path = 'daily-1.parquet'",
+                &[&discovery_id],
+            )
+            .await
+            .unwrap();
+        let repacks = discovery_table_config
+            .find_potential_repacks()
+            .await
+            .unwrap();
+        assert_eq!(repacks.len(), 5, "{repacks:?}");
+        assert!(repacks.iter().all(|repack| repack.level.level == 2));
+        assert_eq!(
+            repacks[0].begin,
+            expected(NaiveDate::from_ymd_opt(2026, 1, 2).unwrap())
+        );
+        assert_eq!(repacks[0].files.len(), 7);
+        assert_eq!(repacks[4].files.len(), 2);
         let inline_table = format!("inline_{index}");
         client
             .batch_execute(&format!(

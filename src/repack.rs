@@ -45,7 +45,9 @@ fn fast_progress(log: &Log, job: &Job, message: String) {
         log,
         format!(
             "{} [{}, {}) fastpack: {message}",
-            job.table, job.begin_date, job.end_date
+            job.table,
+            job.begin.label(&job.table),
+            job.end.label(&job.table)
         ),
     );
 }
@@ -68,10 +70,13 @@ async fn fast_wait<T: Send>(
     }
 }
 
-/// Whether a successful repack expires its immediate predecessor catalog snapshot.
+/// Which catalog snapshots a successful repack expires.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExpireSnapshot {
+    /// Expire every snapshot referencing a replaced file, even with deduplication.
+    /// This affects time travel for every table in the catalog.
+    Referencing,
     /// Expire even when deduplication can change logical data.
     Always,
     /// Expire only when deduplication is disabled (`unique` is `None`).
@@ -86,7 +91,84 @@ impl ExpireSnapshot {
     }
 
     fn enabled(self, deduplication_enabled: bool) -> bool {
-        self == Self::Always || (self == Self::IfNoDedup && !deduplication_enabled)
+        matches!(self, Self::Always | Self::Referencing)
+            || (self == Self::IfNoDedup && !deduplication_enabled)
+    }
+}
+
+/// What a repack does when its sources hold rows outside the window, which
+/// would otherwise produce separate before/after files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Strictness {
+    /// Fail before reading data unless the result is one in-window file.
+    Raise,
+    /// Write every row of the selected sources into one file, ignoring the window.
+    Mash,
+}
+
+/// A window bound in the time column's domain: an instant for `timestamptz`,
+/// wall-clock time for `timestamp`, and midnight for `date`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bound {
+    Tz(DateTime<Utc>),
+    Naive(chrono::NaiveDateTime),
+}
+
+impl Bound {
+    /// Instant used internally; naive values map to UTC with identical fields.
+    pub fn utc(self) -> DateTime<Utc> {
+        match self {
+            Self::Tz(time) => time,
+            Self::Naive(time) => time.and_utc(),
+        }
+    }
+
+    pub(crate) fn for_table(table: &Table, time: DateTime<Utc>) -> Self {
+        match table.time_type {
+            TimeType::TimestampTz => Self::Tz(time),
+            TimeType::Timestamp | TimeType::Date => Self::Naive(time.naive_utc()),
+        }
+    }
+
+    fn local(self, table: &Table) -> chrono::NaiveDateTime {
+        match self {
+            Self::Tz(time) => time.with_timezone(&table.timezone).naive_local(),
+            Self::Naive(time) => time,
+        }
+    }
+
+    /// Table-local wall-clock time for logs; just the date at midnight.
+    fn label(self, table: &Table) -> String {
+        let local = self.local(table);
+        if local.time() == chrono::NaiveTime::MIN {
+            local.date().to_string()
+        } else {
+            local.to_string()
+        }
+    }
+
+    fn validate(self, table: &Table, name: &str) -> Result<()> {
+        match (self, table.time_type) {
+            (Self::Tz(_), TimeType::TimestampTz) => Ok(()),
+            (Self::Naive(_), TimeType::Timestamp) => Ok(()),
+            (Self::Naive(time), TimeType::Date) if time.time() == chrono::NaiveTime::MIN => Ok(()),
+            (Self::Naive(_), TimeType::Date) => bail!("{name} must be midnight for a date column"),
+            (Self::Tz(_), _) => bail!("{name} must be a naive bound for a timestamp/date column"),
+            (Self::Naive(_), TimeType::TimestampTz) => {
+                bail!("{name} must be a tz bound for a timestamptz column")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Bound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tz(time) => write!(f, "{}", time.to_rfc3339()),
+            Self::Naive(time) => write!(f, "{time}"),
+        }
     }
 }
 
@@ -98,8 +180,9 @@ pub struct Job {
         deserialize_with = "deserialize_table"
     )]
     pub table: Table,
-    pub begin_date: NaiveDate,
-    pub end_date: NaiveDate,
+    pub begin: Bound,
+    /// Exclusive.
+    pub end: Bound,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +190,9 @@ pub struct Job {
     /// Catalog-wide expiry, committed atomically with the replacement snapshot.
     #[serde(default, skip_serializing_if = "ExpireSnapshot::is_never")]
     pub expire_snapshot: ExpireSnapshot,
+    /// `None` keeps out-of-window rows in separate before/after files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strictness: Option<Strictness>,
 }
 
 fn serialize_table<S: serde::Serializer>(
@@ -131,25 +217,40 @@ fn deserialize_table<'de, D: serde::Deserializer<'de>>(
 }
 
 impl Table {
-    /// Build a job using table deduplication policy, no file guard, and `IfNoDedup`.
-    pub fn repack(&self, begin_date: NaiveDate, end_date: NaiveDate) -> Job {
+    /// Build a job between table-timezone midnights using table deduplication
+    /// policy, no file guard, and `IfNoDedup`.
+    pub fn repack(&self, begin_date: NaiveDate, end_date: NaiveDate) -> Result<Job> {
+        Ok(self.repack_between(
+            Bound::for_table(self, self.midnight(begin_date)?),
+            Bound::for_table(self, self.midnight(end_date)?),
+        ))
+    }
+
+    /// Build a job for an arbitrary `[begin, end)` window with the default options.
+    pub fn repack_between(&self, begin: Bound, end: Bound) -> Job {
         Job {
             table: self.clone(),
-            begin_date,
-            end_date,
+            begin,
+            end,
             unique: None,
             files: None,
             expire_snapshot: ExpireSnapshot::IfNoDedup,
+            strictness: None,
         }
     }
 
     /// Validate and repack immediately with the default job options.
     pub async fn repack_now(&self, begin_date: NaiveDate, end_date: NaiveDate) -> Result<()> {
-        self.repack(begin_date, end_date).run().await
+        self.repack(begin_date, end_date)?.run().await
     }
 }
 
 impl Job {
+    pub fn with_strictness(mut self, strictness: Strictness) -> Self {
+        self.strictness = Some(strictness);
+        self
+    }
+
     pub fn with_unique(mut self, columns: Vec<String>) -> Self {
         self.unique = Some(columns);
         self
@@ -195,14 +296,15 @@ impl Job {
         if self.effective_unique().is_some() && self.table.dedup_timestamp.is_none() {
             bail!("deduplication requires a dedup timestamp column");
         }
-        if self.begin_date >= self.end_date {
-            bail!("begin_date must precede end_date (exclusive)");
+        self.begin.validate(&self.table, "begin")?;
+        self.end.validate(&self.table, "end")?;
+        if self.begin.utc() >= self.end.utc() {
+            bail!("begin must precede end (exclusive)");
         }
-        self.begin_date
+        self.begin
+            .local(&self.table)
             .checked_add_months(Months::new(1))
             .context("date is out of range")?;
-        self.start()?;
-        self.end()?;
         Ok(())
     }
 
@@ -242,17 +344,18 @@ impl Job {
     }
 
     fn start(&self) -> Result<DateTime<Utc>> {
-        self.table.midnight(self.begin_date)
+        Ok(self.begin.utc())
     }
 
     fn end(&self) -> Result<DateTime<Utc>> {
-        self.table.midnight(self.end_date)
+        Ok(self.end.utc())
     }
 
     fn node_only(&self) -> bool {
-        self.begin_date
+        self.begin
+            .local(&self.table)
             .checked_add_months(Months::new(1))
-            .is_some_and(|d| self.end_date >= d)
+            .is_some_and(|d| self.end.local(&self.table) >= d)
     }
 }
 
@@ -1541,7 +1644,7 @@ async fn prepare(context: PrepareContext<'_>) -> Result<Vec<FileInfo>> {
     Ok(files)
 }
 
-async fn lock_range(client: &Client, job: &Job) -> Result<()> {
+async fn lock_range(client: &Client, job: &Job, window: Window) -> Result<()> {
     let (schema, table) = job.names();
     let statement = client
         .prepare("SELECT pg_advisory_lock(hashtextextended($1, 0))")
@@ -1549,18 +1652,13 @@ async fn lock_range(client: &Client, job: &Job) -> Result<()> {
         .context("preparing repack advisory locks")?;
     // Use a fixed per-table lock timezone, not the request's timezone. This also
     // retains lock identities when extracting an existing deployed worker.
-    let last_instant = job
-        .end()?
+    // Naive/date bounds are stored with identical UTC fields, so these are
+    // calendar dates for those domains.
+    let last_instant = window
+        .end
         .checked_sub_signed(chrono::Duration::microseconds(1))
         .context("lock range underflow")?;
-    let (mut date, last) = if job.table.time_type == TimeType::TimestampTz {
-        (
-            job.start()?.with_timezone(&chrono_tz::UTC).date_naive(),
-            last_instant.with_timezone(&chrono_tz::UTC).date_naive(),
-        )
-    } else {
-        (job.begin_date, last_instant.date_naive())
-    };
+    let (mut date, last) = (window.start.date_naive(), last_instant.date_naive());
     while date <= last {
         let key = format!("{}:{schema}.{table}:{date}", job.table.lock_namespace);
         client
@@ -1590,6 +1688,55 @@ async fn has_current_files(c: &impl GenericClient, table_id: i64, job: &Job) -> 
     .await
     .context("checking repack files in current snapshot")?
     .try_get(0)?)
+}
+
+/// Explains why statistics cannot prove every selected row lies inside `window`.
+async fn sources_outside(
+    c: &impl GenericClient,
+    table_id: i64,
+    utc_col: i64,
+    table: &Table,
+    window: Window,
+    selected: &[Source],
+) -> Result<Option<String>> {
+    let ids: Vec<i64> = selected.iter().map(|s| s.id).collect();
+    let rows = c
+        .query(
+            &format!(
+                "SELECT f.data_file_id, f.path,
+                        s.min_value IS NULL OR s.max_value IS NULL OR s.null_count IS NULL
+                            OR s.null_count > 0,
+                        s.min_value::{ty} < $4::text::{ty} OR s.max_value::{ty} >= $5::text::{ty}
+                   FROM ducklake.ducklake_data_file f
+                   LEFT JOIN ducklake.ducklake_file_column_stats s
+                     ON s.table_id = f.table_id AND s.data_file_id = f.data_file_id
+                    AND s.column_id = $2
+                  WHERE f.table_id = $1 AND f.data_file_id = ANY($3)
+                  ORDER BY f.data_file_id",
+                ty = table.time_type.sql()
+            ),
+            &[
+                &table_id,
+                &utc_col,
+                &ids,
+                &table.bound(window.start),
+                &table.bound(window.end),
+            ],
+        )
+        .await
+        .context("checking strict repack source bounds")?;
+    for row in rows {
+        let path: String = row.get(1);
+        if row.get::<_, bool>(2) {
+            return Ok(Some(format!(
+                "source {path} has missing or null time statistics"
+            )));
+        }
+        if row.get::<_, Option<bool>>(3) == Some(true) {
+            return Ok(Some(format!("source {path} has rows outside the window")));
+        }
+    }
+    Ok(None)
 }
 
 async fn check_inlined(
@@ -1880,7 +2027,7 @@ async fn commit(
         }
     }
     if expire {
-        expire::predecessor(&tx, meta, selected, prev).await?;
+        expire::snapshots(&tx, meta, selected, prev, job.expire_snapshot).await?;
     }
     tx.commit().await.context("committing repack snapshot")?;
     Ok((
@@ -1979,16 +2126,11 @@ pub(crate) async fn replace_window(
     let end_date = date(last)
         .succ_opt()
         .context("replacement window end is out of range")?;
-    let job = Job {
-        table: table.clone(),
-        begin_date,
-        end_date,
-        unique: None,
-        files: None,
-        expire_snapshot: ExpireSnapshot::Never,
-    };
+    let job = table
+        .repack(begin_date, end_date)?
+        .with_expire_snapshot(ExpireSnapshot::Never);
     job.validate()?;
-    lock_range(client, &job).await?;
+    lock_range(client, &job, Window::for_job(&job)?).await?;
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
@@ -2091,15 +2233,21 @@ async fn run(job: &Job) -> Result<()> {
         log,
         format!(
             "waiting for repack advisory locks on {} [{}, {}) {}",
-            job.table, job.begin_date, job.end_date, job.table.timezone
+            job.table,
+            job.begin.label(&job.table),
+            job.end.label(&job.table),
+            job.table.timezone
         ),
     );
-    lock_range(&client, job).await?;
+    lock_range(&client, job, window).await?;
     progress(
         log,
         format!(
             "acquired repack advisory locks on {} [{}, {}) {}",
-            job.table, job.begin_date, job.end_date, job.table.timezone
+            job.table,
+            job.begin.label(&job.table),
+            job.end.label(&job.table),
+            job.table.timezone
         ),
     );
     let (schema_name, table_name) = job.names();
@@ -2138,6 +2286,22 @@ async fn run(job: &Job) -> Result<()> {
     );
     check_inlined(&tx, meta.table_id, &job.table, window).await?;
     let selected = sources(&tx, meta.table_id, utc_col, &job.table, window).await?;
+    let split = match job.strictness {
+        None => window,
+        Some(Strictness::Raise) => {
+            if let Some(reason) =
+                sources_outside(&tx, meta.table_id, utc_col, &job.table, window, &selected).await?
+            {
+                bail!("strict repack would not produce exactly one in-window file: {reason}");
+            }
+            window
+        }
+        // Every selected row is in range, so only one output region is written.
+        Some(Strictness::Mash) => Window {
+            start: DateTime::<Utc>::MIN_UTC,
+            end: DateTime::<Utc>::MAX_UTC,
+        },
+    };
     tx.commit().await?;
     if selected.is_empty() {
         progress(log, "no source files overlap the requested range".into());
@@ -2166,12 +2330,18 @@ async fn run(job: &Job) -> Result<()> {
             meta: &meta,
             sources: &selected,
             job,
-            window,
+            window: split,
             discard_inside: false,
             work: &mut work,
             log,
         })
         .await?;
+        if job.strictness == Some(Strictness::Raise) && files.len() > 1 {
+            bail!(
+                "strict repack produced {} files instead of one in-window file",
+                files.len()
+            );
+        }
         // Never delete published files if a lost COMMIT response makes the outcome uncertain.
         work.outputs.clear();
         let mut attempt = 1;
@@ -2212,8 +2382,13 @@ async fn run(job: &Job) -> Result<()> {
             .expire_snapshot
             .enabled(job.effective_unique().is_some())
         {
-            progress(log, format!("expired predecessor snapshot {} atomically with snapshot {snapshot}; \
-                replaced files needed by retained snapshots were preserved", snapshot - 1));
+            if job.expire_snapshot == ExpireSnapshot::Referencing {
+                progress(log, format!("expired snapshots referencing replaced files atomically with snapshot {snapshot}; \
+                    replaced files queued for cleanup"));
+            } else {
+                progress(log, format!("expired predecessor snapshot {} atomically with snapshot {snapshot}; \
+                    replaced files needed by retained snapshots were preserved", snapshot - 1));
+            }
         }
         Ok(())
     }.await;
@@ -2237,11 +2412,10 @@ mod tests {
         use datafusion::arrow::array::{Date32Array, TimestampMicrosecondArray};
         for kind in [TimeType::TimestampTz, TimeType::Timestamp, TimeType::Date] {
             let mut job = test_job(None);
-            job.begin_date = "2026-01-02".parse().unwrap();
-            job.end_date = "2026-01-03".parse().unwrap();
             job.table.time_type = kind;
             job.table.timezone = chrono_tz::UTC;
             job.table.time_column = "observed".into();
+            set_dates(&mut job, "2026-01-02", "2026-01-03");
             let column: ArrayRef = if kind == TimeType::Date {
                 Arc::new(Date32Array::from(vec![20454, 20455, 20456]))
             } else {
@@ -2438,14 +2612,33 @@ mod tests {
     }
 
     fn test_job(unique: Option<Vec<String>>) -> Job {
-        Job {
+        let mut job = Job {
             table: crate::test_support::table(),
-            begin_date: "2026-01-01".parse().unwrap(),
-            end_date: "2026-02-01".parse().unwrap(),
+            begin: Bound::Tz(DateTime::<Utc>::MIN_UTC),
+            end: Bound::Tz(DateTime::<Utc>::MIN_UTC),
             unique,
             files: None,
             expire_snapshot: ExpireSnapshot::Never,
-        }
+            strictness: None,
+        };
+        set_dates(&mut job, "2026-01-01", "2026-02-01");
+        job
+    }
+
+    fn date_bound(date: &str) -> Bound {
+        let table = crate::test_support::table();
+        Bound::for_table(&table, table.midnight(date.parse().unwrap()).unwrap())
+    }
+
+    /// Sets midnight bounds in the job table's current timezone and type.
+    fn set_dates(job: &mut Job, begin: &str, end: &str) {
+        let bound = |date: &str| {
+            Bound::for_table(
+                &job.table,
+                job.table.midnight(date.parse().unwrap()).unwrap(),
+            )
+        };
+        (job.begin, job.end) = (bound(begin), bound(end));
     }
 
     #[tokio::test]
@@ -2456,7 +2649,7 @@ mod tests {
         table.unique_by_cols = Some(vec!["node".into(), "utcbegin".into()]);
         let begin = "2026-01-01".parse().unwrap();
         let end = "2026-02-01".parse().unwrap();
-        let job = table.repack(begin, end);
+        let job = table.repack(begin, end).unwrap();
         assert_eq!(job.effective_unique(), table.unique_by_cols.as_ref());
         assert_eq!(job.files, None);
         assert_eq!(job.expire_snapshot, ExpireSnapshot::IfNoDedup);
@@ -2474,11 +2667,12 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("begin_date")
+                .contains("begin must precede end")
         );
         assert!(
             table
                 .repack(begin, end)
+                .unwrap()
                 .with_unique(vec![])
                 .run()
                 .await
@@ -2488,7 +2682,7 @@ mod tests {
         );
         assert!(messages.lock().unwrap().is_empty());
         table.unique_by_cols = None;
-        assert_eq!(table.repack(begin, end).effective_unique(), None);
+        assert_eq!(table.repack(begin, end).unwrap().effective_unique(), None);
 
         let encoded = serde_json::to_value(&job).unwrap();
         assert_eq!(encoded["table"], "ciso.rtprices");
@@ -3358,10 +3552,14 @@ mod tests {
         });
         let default: Job = crate::test_support::job_from_value(base.clone()).unwrap();
         assert_eq!(default.expire_snapshot, ExpireSnapshot::Never);
-        let mut canonical = base.clone();
-        canonical["table"] = serde_json::json!("ciso.rtprices");
+        let canonical = serde_json::json!({
+            "table": "ciso.rtprices",
+            "begin": {"tz": "2026-01-01T08:00:00Z"},
+            "end": {"tz": "2026-02-01T08:00:00Z"},
+        });
         assert_eq!(serde_json::to_value(default).unwrap(), canonical);
         for (policy, encoded, no_dedup, dedup) in [
+            (ExpireSnapshot::Referencing, "referencing", true, true),
             (ExpireSnapshot::Always, "always", true, true),
             (ExpireSnapshot::IfNoDedup, "if_no_dedup", true, false),
             (ExpireSnapshot::Never, "never", false, false),
@@ -3395,8 +3593,11 @@ mod tests {
         let job: Job = crate::test_support::job_from_value(base.clone()).unwrap();
         job.validate().unwrap();
         assert!(job.files.is_none());
-        let mut canonical = base.clone();
-        canonical["table"] = serde_json::json!("ciso.rtprices");
+        let canonical = serde_json::json!({
+            "table": "ciso.rtprices",
+            "begin": {"tz": "2026-01-01T08:00:00Z"},
+            "end": {"tz": "2026-02-01T08:00:00Z"},
+        });
         assert_eq!(serde_json::to_value(job).unwrap(), canonical);
         for files in [
             serde_json::Value::Null,
@@ -3437,18 +3638,18 @@ mod tests {
         let (owner, owner_connection) = test_database().await;
         let (waiter, waiter_connection) = test_database().await;
         let mut first = test_job(None);
-        first.begin_date = "2026-01-01".parse().unwrap();
-        first.end_date = "2026-01-02".parse().unwrap();
         first.table.timezone = chrono_tz::UTC;
+        set_dates(&mut first, "2026-01-01", "2026-01-02");
         let mut second = first.clone();
-        second.begin_date = "2026-01-02".parse().unwrap();
-        second.end_date = "2026-01-03".parse().unwrap();
         second.table.timezone = chrono_tz::Asia::Tokyo;
-        lock_range(&owner, &first).await.unwrap();
+        set_dates(&mut second, "2026-01-02", "2026-01-03");
+        lock_range(&owner, &first, Window::for_job(&first).unwrap())
+            .await
+            .unwrap();
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(100),
-                lock_range(&waiter, &second)
+                lock_range(&waiter, &second, Window::for_job(&second).unwrap())
             )
             .await
             .is_err()
@@ -3473,7 +3674,10 @@ mod tests {
         }))
         .unwrap();
         job.table.timezone = chrono_tz::UTC;
-        lock_range(&owner, &job).await.unwrap();
+        set_dates(&mut job, "2026-01-01", "2026-02-01");
+        lock_range(&owner, &job, Window::for_job(&job).unwrap())
+            .await
+            .unwrap();
         let owner_pid: i32 = owner
             .query_one("SELECT pg_backend_pid()", &[])
             .await
@@ -3494,8 +3698,11 @@ mod tests {
         }))
         .unwrap();
         alias.table.timezone = chrono_tz::UTC;
+        set_dates(&mut alias, "2026-01-15", "2026-02-15");
         let mut waiting = tokio::spawn(async move {
-            lock_range(&waiter, &alias).await.unwrap();
+            lock_range(&waiter, &alias, Window::for_job(&alias).unwrap())
+                .await
+                .unwrap();
             waiter
         });
         timeout(Duration::from_secs(5), async {
@@ -3537,10 +3744,15 @@ mod tests {
             }))
             .unwrap();
             other_job.table.timezone = chrono_tz::UTC;
-            timeout(Duration::from_secs(5), lock_range(&other, &other_job))
-                .await
-                .unwrap()
-                .unwrap();
+            set_dates(&mut other_job, begin, end);
+            let window = Window::for_job(&other_job).unwrap();
+            timeout(
+                Duration::from_secs(5),
+                lock_range(&other, &other_job, window),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let held: i64 = other
                 .query_one(
                     "SELECT count(*) FROM pg_locks
@@ -3702,11 +3914,12 @@ mod tests {
                     table: table.into(),
                     ..crate::test_support::table()
                 },
-                begin_date: "2026-01-01".parse().unwrap(),
-                end_date: "2026-02-01".parse().unwrap(),
+                begin: date_bound("2026-01-01"),
+                end: date_bound("2026-02-01"),
                 unique: None,
                 files: None,
                 expire_snapshot: ExpireSnapshot::Never,
+                strictness: None,
             };
             assert!(job.validate().is_err());
         }
@@ -3757,11 +3970,12 @@ mod tests {
         ] {
             let job = Job {
                 table: crate::test_support::table(),
-                begin_date: begin.parse().unwrap(),
-                end_date: end.parse().unwrap(),
+                begin: date_bound(begin),
+                end: date_bound(end),
                 unique: None,
                 files: None,
                 expire_snapshot: ExpireSnapshot::Never,
+                strictness: None,
             };
             job.validate().unwrap();
             let start = DateTime::parse_from_rfc3339(expected_start)
@@ -3801,11 +4015,12 @@ mod tests {
         }
         let job = Job {
             table: crate::test_support::table(),
-            begin_date: "2026-03-01".parse().unwrap(),
-            end_date: "2026-04-01".parse().unwrap(),
+            begin: date_bound("2026-03-01"),
+            end: date_bound("2026-04-01"),
             unique: None,
             files: None,
             expire_snapshot: ExpireSnapshot::Never,
+            strictness: None,
         };
         assert!(job.node_only());
         assert_eq!(

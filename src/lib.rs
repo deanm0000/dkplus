@@ -28,6 +28,7 @@ pub mod config;
 pub mod maintenance;
 pub mod parquet;
 pub mod repack;
+pub mod tags;
 mod types;
 
 const MAX_COMMIT_ATTEMPTS: u32 = 6;
@@ -87,6 +88,10 @@ pub(crate) struct FileInfo {
 }
 
 pub async fn connect(cfg: &Config) -> Result<Client> {
+    connect_catalog(&cfg.postgres, cfg.log.clone()).await
+}
+
+pub(crate) async fn connect_catalog(postgres: &tokio_postgres::Config, log: Log) -> Result<Client> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let tls = MakeRustlsConnect::new(
@@ -97,12 +102,10 @@ pub async fn connect(cfg: &Config) -> Result<Client> {
         .with_root_certificates(roots)
         .with_no_client_auth(),
     );
-    let (client, conn) = cfg
-        .postgres
+    let (client, conn) = postgres
         .connect(tls)
         .await
         .context("connecting to postgres")?;
-    let log = cfg.log.clone();
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             log(&format!("postgres connection error: {e}"));
@@ -252,10 +255,11 @@ async fn table_tags(c: &impl GenericClient, table_id: i64) -> Result<HashMap<Str
                      FROM ducklake.ducklake_snapshot
                ) latest
               WHERE tag.object_id = $1
-                AND tag.key IN (
+                AND (tag.key IN (
                     'dkplus.time_column', 'dkplus.timezone', 'dkplus.row_group_col',
-                    'dkplus.sort_cols', 'dkplus.unique_by_cols', 'dkplus.dedup_timestamp'
-                )
+                    'dkplus.sort_cols', 'dkplus.unique_by_cols', 'dkplus.dedup_timestamp',
+                    'dkplus.granularity'
+                ) OR tag.key LIKE 'dkplus.repack\\_level%')
                 AND tag.begin_snapshot <= latest.snapshot_id
                 AND (tag.end_snapshot IS NULL OR tag.end_snapshot > latest.snapshot_id)",
             &[&table_id],
@@ -279,6 +283,9 @@ const TAG_ROW_GROUP_COL: &str = "dkplus.row_group_col";
 const TAG_SORT_COLS: &str = "dkplus.sort_cols";
 const TAG_UNIQUE_BY_COLS: &str = "dkplus.unique_by_cols";
 const TAG_DEDUP_TIMESTAMP: &str = "dkplus.dedup_timestamp";
+const TAG_GRANULARITY: &str = "dkplus.granularity";
+const TAG_LEVEL_PREFIX: &str = "dkplus.repack_level";
+const UNPREDICTABLE: &str = "unpredictable";
 
 fn tag_value<T: serde::de::DeserializeOwned>(
     tags: &HashMap<String, String>,
@@ -302,33 +309,200 @@ fn overridden_tag<T: serde::de::DeserializeOwned>(
     }
 }
 
-async fn column_timezone_tags(
-    c: &impl GenericClient,
-    table_id: i64,
-) -> Result<HashMap<i64, String>> {
+/// Active `dkplus.timezone` and `dkplus.granularity` column tags, keyed by
+/// column ID and then tag key.
+type ColumnTags = HashMap<i64, HashMap<String, String>>;
+
+async fn column_tags(c: &impl GenericClient, table_id: i64) -> Result<ColumnTags> {
     let rows = c
         .query(
-            "SELECT tag.column_id, tag.value
+            "SELECT tag.column_id, tag.key, tag.value
                FROM ducklake.ducklake_column_tag tag
                CROSS JOIN LATERAL (
                    SELECT max(snapshot_id) AS snapshot_id
                      FROM ducklake.ducklake_snapshot
                ) latest
-              WHERE tag.table_id = $1 AND tag.key = 'dkplus.timezone'
+              WHERE tag.table_id = $1 AND tag.key IN ('dkplus.timezone', 'dkplus.granularity')
                 AND tag.begin_snapshot <= latest.snapshot_id
                 AND (tag.end_snapshot IS NULL OR tag.end_snapshot > latest.snapshot_id)",
             &[&table_id],
         )
         .await
-        .context("reading active DuckLake column timezone tags")?;
-    let mut tags = HashMap::new();
+        .context("reading active DuckLake column tags")?;
+    let mut tags: ColumnTags = HashMap::new();
     for row in rows {
         let column_id: i64 = row.get(0);
-        if tags.insert(column_id, row.get(1)).is_some() {
-            bail!("multiple active DuckLake timezone tags for column {column_id}");
+        let key: String = row.get(1);
+        if tags
+            .entry(column_id)
+            .or_default()
+            .insert(key.clone(), row.get(2))
+            .is_some()
+        {
+            bail!("multiple active DuckLake {key:?} tags for column {column_id}");
         }
     }
     Ok(tags)
+}
+
+/// A column tag, falling back to the same table-level key.
+fn time_column_tag<'a>(
+    tags: &'a HashMap<String, String>,
+    column_tags: &'a ColumnTags,
+    column_id: i64,
+    key: &str,
+) -> Option<(&'a String, bool)> {
+    column_tags
+        .get(&column_id)
+        .and_then(|tags| tags.get(key))
+        .map(|value| (value, true))
+        .or_else(|| tags.get(key).map(|value| (value, false)))
+}
+
+fn decode_tag<T: serde::de::DeserializeOwned>(value: &str, key: &str, column: bool) -> Result<T> {
+    let kind = if column { "column tag" } else { "tag" };
+    serde_json::from_str(value).with_context(|| format!("decoding DuckLake {kind} {key:?}"))
+}
+
+/// `(key, rule, value)` tag entries keyed by repack level number.
+type LevelTags<'a> = std::collections::BTreeMap<u32, Vec<(&'a str, &'a str, &'a str)>>;
+
+/// Raw `dkplus.repack_level<N>_<rule>` values grouped by level number.
+fn level_tags(tags: &HashMap<String, String>) -> Result<LevelTags<'_>> {
+    let mut levels = std::collections::BTreeMap::new();
+    for (key, value) in tags {
+        let Some(rest) = key.strip_prefix(TAG_LEVEL_PREFIX) else {
+            continue;
+        };
+        let (number, rule) = rest
+            .split_once('_')
+            .with_context(|| format!("invalid repack level tag {key:?}"))?;
+        let number: u32 = number
+            .parse()
+            .ok()
+            .filter(|n| *n > 0 && !number.starts_with('0'))
+            .with_context(|| format!("invalid repack level number in tag {key:?}"))?;
+        levels
+            .entry(number)
+            .or_insert_with(Vec::new)
+            .push((key.as_str(), rule, value.as_str()));
+    }
+    Ok(levels)
+}
+
+const LEVEL_INTERVAL_RULES: [&str; 8] = [
+    "targetwindow_min",
+    "targetwindow_max",
+    "sourcewindow_min",
+    "sourcewindow_max",
+    "age_min",
+    "age_max",
+    "relage_min",
+    "relage_max",
+];
+
+/// Interval texts that tag resolution will need, parsed by Postgres.
+fn interval_texts(
+    builder: &TableBuilder,
+    meta: &TableMeta,
+    tags: &HashMap<String, String>,
+    column_tags: &ColumnTags,
+) -> Result<Vec<String>> {
+    let mut texts = Vec::new();
+    if builder.granularity.is_none()
+        && let Some(time_column) =
+            overridden_tag(builder.time_column.clone(), tags, TAG_TIME_COLUMN)?
+        && let Some(column) = meta.columns.get(&time_column)
+        && let Some((value, column)) =
+            time_column_tag(tags, column_tags, column.id, TAG_GRANULARITY)
+        && let Some(text) = decode_tag::<Option<String>>(value, TAG_GRANULARITY, column)?
+        && text != UNPREDICTABLE
+    {
+        texts.push(text);
+    }
+    if builder.repack_levels.is_none() {
+        for (key, rule, value) in level_tags(tags)?.into_values().flatten() {
+            if LEVEL_INTERVAL_RULES.contains(&rule)
+                && let Some(text) = decode_tag::<Option<String>>(value, key, false)?
+            {
+                texts.push(text);
+            }
+        }
+    }
+    texts.sort();
+    texts.dedup();
+    Ok(texts)
+}
+
+async fn parse_intervals(
+    c: &impl GenericClient,
+    texts: Vec<String>,
+) -> Result<HashMap<String, maintenance::Interval>> {
+    let mut parsed = HashMap::new();
+    for text in texts {
+        let row = c
+            .query_one(
+                "SELECT (extract(year FROM i) * 12 + extract(month FROM i))::int4,
+                        extract(day FROM i)::int4,
+                        (extract(hour FROM i) * 3600000000 + extract(minute FROM i) * 60000000
+                            + extract(microseconds FROM i))::int8
+                   FROM (SELECT $1::text::interval AS i) v",
+                &[&text],
+            )
+            .await
+            .with_context(|| format!("parsing interval tag value {text:?}"))?;
+        parsed.insert(
+            text,
+            maintenance::Interval::new(row.get(0), row.get(1), row.get(2)),
+        );
+    }
+    Ok(parsed)
+}
+
+fn interval(
+    intervals: &HashMap<String, maintenance::Interval>,
+    text: &str,
+) -> Result<maintenance::Interval> {
+    intervals
+        .get(text)
+        .copied()
+        .with_context(|| format!("interval {text:?} was not parsed"))
+}
+
+fn resolve_levels(
+    tags: &HashMap<String, String>,
+    intervals: &HashMap<String, maintenance::Interval>,
+) -> Result<Vec<maintenance::RepackLevel>> {
+    let mut levels = Vec::new();
+    for (number, rules) in level_tags(tags)? {
+        let mut level = maintenance::RepackLevel::new(number);
+        for (key, rule, value) in rules {
+            let Some(text) = decode_tag::<Option<String>>(value, key, false)? else {
+                continue;
+            };
+            let slot = match rule {
+                "targetwindow_min" => &mut level.targetwindow_min,
+                "targetwindow_max" => &mut level.targetwindow_max,
+                "sourcewindow_min" => &mut level.sourcewindow_min,
+                "sourcewindow_max" => &mut level.sourcewindow_max,
+                "age_min" => &mut level.age_min,
+                "age_max" => &mut level.age_max,
+                "relage_min" => &mut level.relage_min,
+                "relage_max" => &mut level.relage_max,
+                "calendar_begin" => {
+                    level.calendar_begin = Some(
+                        text.parse()
+                            .with_context(|| format!("decoding DuckLake tag {key:?}"))?,
+                    );
+                    continue;
+                }
+                _ => bail!("unknown repack level rule in tag {key:?}"),
+            };
+            *slot = Some(interval(intervals, &text)?);
+        }
+        levels.push(level);
+    }
+    Ok(levels)
 }
 
 pub(crate) async fn resolve_table(builder: TableBuilder) -> Result<Table> {
@@ -346,18 +520,21 @@ pub(crate) async fn resolve_table(builder: TableBuilder) -> Result<Table> {
         .await?;
     let meta = table_meta(&tx, &builder.schema, &builder.table).await?;
     let tags = table_tags(&tx, meta.table_id).await?;
-    let column_tags = column_timezone_tags(&tx, meta.table_id).await?;
+    let column_tags = column_tags(&tx, meta.table_id).await?;
+    let intervals =
+        parse_intervals(&tx, interval_texts(&builder, &meta, &tags, &column_tags)?).await?;
     tx.commit()
         .await
         .context("finishing table policy read transaction")?;
-    resolve_table_settings(builder, &meta, &tags, &column_tags)
+    resolve_table_settings(builder, &meta, &tags, &column_tags, &intervals)
 }
 
 fn resolve_table_settings(
     builder: TableBuilder,
     meta: &TableMeta,
     tags: &HashMap<String, String>,
-    column_tags: &HashMap<i64, String>,
+    column_tags: &ColumnTags,
+    intervals: &HashMap<String, maintenance::Interval>,
 ) -> Result<Table> {
     let time_column = overridden_tag(builder.time_column, tags, TAG_TIME_COLUMN)?
         .context("missing required table setting \"time_column\"")?;
@@ -367,19 +544,15 @@ fn resolve_table_settings(
         .with_context(|| format!("table has no configured time column {time_column:?}"))?;
     let timezone = match builder.timezone {
         Some(timezone) => timezone,
-        None => match column_tags.get(&time_col.id) {
-            Some(value) => Some(
-                serde_json::from_str::<String>(value)
-                    .context("decoding DuckLake column tag \"dkplus.timezone\"")?,
-            ),
-            None => tag_value::<String>(tags, TAG_TIMEZONE)?,
-        }
-        .map(|zone| {
-            zone.parse::<chrono_tz::Tz>()
-                .with_context(|| format!("invalid timezone tag {zone:?}"))
-        })
-        .transpose()?
-        .context("missing required table setting \"timezone\"")?,
+        None => time_column_tag(tags, column_tags, time_col.id, TAG_TIMEZONE)
+            .map(|(value, column)| decode_tag::<String>(value, TAG_TIMEZONE, column))
+            .transpose()?
+            .map(|zone| {
+                zone.parse::<chrono_tz::Tz>()
+                    .with_context(|| format!("invalid timezone tag {zone:?}"))
+            })
+            .transpose()?
+            .context("missing required table setting \"timezone\"")?,
     };
     let sort_cols = overridden_tag(builder.sort_cols, tags, TAG_SORT_COLS)?
         .context("missing required table setting \"sort_cols\"")?;
@@ -389,6 +562,23 @@ fn resolve_table_settings(
         overridden_tag(builder.unique_by_cols, tags, TAG_UNIQUE_BY_COLS)?.unwrap_or(None);
     let dedup_timestamp =
         overridden_tag(builder.dedup_timestamp, tags, TAG_DEDUP_TIMESTAMP)?.unwrap_or(None);
+    let granularity = match builder.granularity {
+        Some(granularity) => Some(granularity),
+        None => match time_column_tag(tags, column_tags, time_col.id, TAG_GRANULARITY)
+            .map(|(value, column)| decode_tag::<Option<String>>(value, TAG_GRANULARITY, column))
+            .transpose()?
+            .flatten()
+        {
+            Some(text) if text == UNPREDICTABLE => Some(maintenance::Granularity::Unpredictable),
+            Some(text) => Some(maintenance::Granularity::Fixed(interval(intervals, &text)?)),
+            None => None,
+        },
+    };
+    let mut repack_levels = match builder.repack_levels {
+        Some(levels) => levels,
+        None => resolve_levels(tags, intervals)?,
+    };
+    repack_levels.sort_by_key(|level| level.level);
     let time_type = match types::arrow_type(&time_col.ty)? {
         DataType::Date32 => TimeType::Date,
         DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => TimeType::TimestampTz,
@@ -408,6 +598,8 @@ fn resolve_table_settings(
         sort_cols,
         unique_by_cols,
         dedup_timestamp,
+        granularity,
+        repack_levels,
         author: builder.author,
         lock_namespace: builder.lock_namespace.unwrap_or(builder.table),
     };
@@ -1381,6 +1573,7 @@ mod tests {
             &meta,
             &tags,
             &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -1404,7 +1597,14 @@ mod tests {
                 .with_time_column("observed"),
             &meta,
             &tags,
-            &HashMap::from([(1, r#""America/New_York""#.into()), (2, "not-json".into())]),
+            &HashMap::from([
+                (
+                    1,
+                    HashMap::from([(TAG_TIMEZONE.into(), r#""America/New_York""#.into())]),
+                ),
+                (2, HashMap::from([(TAG_TIMEZONE.into(), "not-json".into())])),
+            ]),
+            &HashMap::new(),
         )
         .unwrap();
         assert_eq!(from_column.timezone, chrono_tz::America::New_York);
@@ -1418,6 +1618,7 @@ mod tests {
                 .without_deduplication(),
             &meta,
             &tags,
+            &HashMap::new(),
             &HashMap::new(),
         )
         .unwrap();
@@ -1447,9 +1648,128 @@ mod tests {
             &meta,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("time_column"));
+    }
+
+    #[test]
+    fn granularity_and_repack_levels_resolve_from_tags() {
+        use maintenance::{CalendarUnit, Granularity, Interval, RepackLevel};
+        let meta = TableMeta {
+            table_id: 1,
+            root: String::new(),
+            columns: HashMap::from([(
+                "observed".into(),
+                Column {
+                    id: 1,
+                    ty: "timestamptz".into(),
+                },
+            )]),
+        };
+        let mut tags = HashMap::from([
+            (TAG_TIME_COLUMN.into(), r#""observed""#.into()),
+            (TAG_TIMEZONE.into(), r#""UTC""#.into()),
+            (TAG_SORT_COLS.into(), r#"["observed"]"#.into()),
+            (TAG_GRANULARITY.into(), r#""1 hour""#.into()),
+            ("dkplus.repack_level2_age_min".into(), r#""7 days""#.into()),
+            (
+                "dkplus.repack_level2_relage_min".into(),
+                r#""1 day""#.into(),
+            ),
+            (
+                "dkplus.repack_level2_targetwindow_max".into(),
+                r#""7 days""#.into(),
+            ),
+            (
+                "dkplus.repack_level2_calendar_begin".into(),
+                r#""day""#.into(),
+            ),
+            (
+                "dkplus.repack_level10_sourcewindow_min".into(),
+                r#""1 day""#.into(),
+            ),
+            (
+                "dkplus.repack_level10_targetwindow_max".into(),
+                "null".into(),
+            ),
+        ]);
+        let column_tags = HashMap::from([(
+            1,
+            HashMap::from([(TAG_GRANULARITY.into(), r#""5 minutes""#.into())]),
+        )]);
+        let builder = || Table::builder("weather.observations", &Table::default().cfg);
+        let texts = interval_texts(&builder(), &meta, &tags, &column_tags).unwrap();
+        assert_eq!(texts, ["1 day", "5 minutes", "7 days"]);
+        let intervals = HashMap::from([
+            ("1 hour".to_string(), Interval::hours(1)),
+            ("5 minutes".to_string(), Interval::minutes(5)),
+            ("1 day".to_string(), Interval::days(1)),
+            ("7 days".to_string(), Interval::days(7)),
+        ]);
+        let table =
+            resolve_table_settings(builder(), &meta, &tags, &column_tags, &intervals).unwrap();
+        // The column tag wins over the table tag.
+        assert_eq!(
+            table.granularity,
+            Some(Granularity::Fixed(Interval::minutes(5)))
+        );
+        assert_eq!(
+            table.repack_levels,
+            [
+                RepackLevel {
+                    age_min: Some(Interval::days(7)),
+                    relage_min: Some(Interval::days(1)),
+                    targetwindow_max: Some(Interval::days(7)),
+                    calendar_begin: Some(CalendarUnit::Day),
+                    ..RepackLevel::new(2)
+                },
+                RepackLevel {
+                    sourcewindow_min: Some(Interval::days(1)),
+                    ..RepackLevel::new(10)
+                },
+            ]
+        );
+        let table =
+            resolve_table_settings(builder(), &meta, &tags, &HashMap::new(), &intervals).unwrap();
+        assert_eq!(
+            table.granularity,
+            Some(Granularity::Fixed(Interval::hours(1)))
+        );
+        tags.insert(TAG_GRANULARITY.into(), r#""unpredictable""#.into());
+        let table =
+            resolve_table_settings(builder(), &meta, &tags, &HashMap::new(), &intervals).unwrap();
+        assert_eq!(table.granularity, Some(Granularity::Unpredictable));
+
+        for (key, value, message) in [
+            (
+                "dkplus.repack_level1_window_min",
+                r#""1 day""#,
+                "unknown repack level rule",
+            ),
+            (
+                "dkplus.repack_level01_age_min",
+                r#""1 day""#,
+                "invalid repack level number",
+            ),
+            (
+                "dkplus.repack_level0_age_min",
+                r#""1 day""#,
+                "invalid repack level number",
+            ),
+            (
+                "dkplus.repack_level1_calendar_begin",
+                r#""fortnight""#,
+                "calendar_begin",
+            ),
+        ] {
+            let mut bad = tags.clone();
+            bad.insert(key.into(), value.into());
+            let error = resolve_table_settings(builder(), &meta, &bad, &HashMap::new(), &intervals)
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{key}: {error:#}");
+        }
     }
 
     #[test]

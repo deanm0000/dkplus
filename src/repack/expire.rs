@@ -1,4 +1,4 @@
-use super::{Source, TableMeta, location};
+use super::{ExpireSnapshot, Source, TableMeta, location};
 use anyhow::{Context, Result, bail};
 use tokio_postgres::Transaction;
 
@@ -16,29 +16,44 @@ pub(super) async fn lock(tx: &Transaction<'_>) -> Result<()> {
     .context("locking catalog for repack snapshot expiry")
 }
 
-/// Expire only the commit's predecessor. Collect only this repack's obsolete
+/// Expire the requested snapshots. Collect only this repack's obsolete
 /// files; unrelated obsolete catalog objects can be reclaimed by native expiry.
-pub(super) async fn predecessor(
+pub(super) async fn snapshots(
     tx: &Transaction<'_>,
     meta: &TableMeta,
     selected: &[Source],
     snapshot: i64,
+    policy: ExpireSnapshot,
 ) -> Result<()> {
-    let n = tx
-        .execute(
-            "DELETE FROM ducklake.ducklake_snapshot
-             WHERE snapshot_id = $1 AND snapshot_id < (
-                 SELECT max(snapshot_id) FROM ducklake.ducklake_snapshot)",
-            &[&snapshot],
+    let source_ids: Vec<_> = selected.iter().map(|s| s.id).collect();
+    if policy == ExpireSnapshot::Referencing {
+        tx.execute(
+            "DELETE FROM ducklake.ducklake_snapshot s
+             WHERE s.snapshot_id <= $1 AND EXISTS (
+                 SELECT 1 FROM ducklake.ducklake_data_file f
+                 WHERE f.table_id = $2 AND f.data_file_id = ANY($3)
+                   AND s.snapshot_id >= f.begin_snapshot
+                   AND s.snapshot_id < f.end_snapshot)",
+            &[&snapshot, &meta.table_id, &source_ids],
         )
         .await
-        .context("expiring repack predecessor snapshot")?;
-    if n != 1 {
-        bail!("repack predecessor snapshot changed before expiry");
+        .context("expiring snapshots referencing repack sources")?;
+    } else {
+        let n = tx
+            .execute(
+                "DELETE FROM ducklake.ducklake_snapshot
+             WHERE snapshot_id = $1 AND snapshot_id < (
+                 SELECT max(snapshot_id) FROM ducklake.ducklake_snapshot)",
+                &[&snapshot],
+            )
+            .await
+            .context("expiring repack predecessor snapshot")?;
+        if n != 1 {
+            bail!("repack predecessor snapshot changed before expiry");
+        }
     }
     // Keep snapshot_changes: transactions that started before expiry still need
     // those records for conflict detection, just as with native DuckLake expiry.
-    let source_ids: Vec<_> = selected.iter().map(|s| s.id).collect();
     let data = tx
         .query(
             "DELETE FROM ducklake.ducklake_data_file f

@@ -17,10 +17,23 @@ pub fn table() -> Table {
     }
 }
 
-pub fn job_from_value(value: serde_json::Value) -> serde_json::Result<repack::Job> {
+/// Deserializes a job against the fixture table. Legacy `begin_date` and
+/// `end_date` strings become fixture-timezone midnight bounds.
+pub fn job_from_value(mut value: serde_json::Value) -> serde_json::Result<repack::Job> {
+    use serde::de::Error;
     let qualified = value["table"]
         .as_str()
         .is_some_and(|name| name.contains('.'));
+    if let Some(object) = value.as_object_mut() {
+        for (legacy, key) in [("begin_date", "begin"), ("end_date", "end")] {
+            let Some(date) = object.remove(legacy) else {
+                continue;
+            };
+            let date: chrono::NaiveDate = serde_json::from_value(date)?;
+            let bound = table().midnight(date).map_err(serde_json::Error::custom)?;
+            object.insert(key.into(), serde_json::to_value(repack::Bound::Tz(bound))?);
+        }
+    }
     let mut job: repack::Job = serde_json::from_value(value)?;
     let mut table = table();
     if qualified {

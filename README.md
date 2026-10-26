@@ -66,6 +66,82 @@ and footer size.
 
 ## Catalog configuration and operations
 
+### Set policy tags from the command line
+
+This package builds both the library and the `dkplus` binary (`cargo build --bin
+dkplus`, or `cargo install --path .`). The binary only needs a Postgres connection;
+no object-store credentials are required.
+
+```sh
+dkplus "host=localhost dbname=catalog user=ducklake" "ciso.rtprices" \
+  "time_column" "utcbegin" "row_group_col" "node"
+
+dkplus "host=localhost dbname=catalog user=ducklake" "ciso.rtprices" \
+  "timezone" "America/Los_Angeles" "granularity" "5 minutes"
+
+dkplus "host=localhost dbname=catalog user=ducklake" --file somefile.json
+```
+
+The JSON file maps qualified table names to settings:
+
+```json
+{
+  "ciso.rtprices": {
+    "time_column": "utcbegin",
+    "row_group_col": "node",
+    "sort_cols": ["node", "utcbegin"],
+    "timezone": "America/Los_Angeles",
+    "granularity": "5 minutes"
+  },
+  "ciso.daprices": {
+    "time_column": "utcbegin",
+    "timezone": "America/Los_Angeles",
+    "granularity": "1 hour"
+  }
+}
+```
+
+Keys accept either the short name or the `dkplus.` prefix. Supported settings
+are `time_column`, `row_group_col`, `sort_cols`, `unique_by_cols`,
+`dedup_timestamp`, `timezone`, `granularity`, and the `repack_level<N>_<rule>`
+settings documented below. Unknown keys are errors. File values use native JSON
+strings, arrays, or null, not strings containing JSON. On the command line, pass
+lists as JSON arrays, for example `'["node","utcbegin"]'`; scalar values are
+ordinary strings. `null` disables nullable settings (`row_group_col`,
+`unique_by_cols`, `dedup_timestamp`, `granularity`, and repack rules); it does not
+delete their tags. Other tags remain unchanged.
+
+`timezone` and `granularity` are written as **column tags** on the effective
+`time_column`: the value supplied in the same request, or the existing table tag.
+An error is returned if that column cannot be resolved. Existing column tags on
+other columns are left untouched. Changing `time_column` does not move those tags;
+supply timezone/granularity again if they should apply to the new column.
+
+All tables and referenced columns must exist. Time columns must be dates or
+microsecond timestamps, and dedup timestamp columns must be microsecond
+timestamps. Timezones must be recognized IANA names; granularity must be a
+positive Postgres interval (whole days/months for date columns), or
+`unpredictable`. Repack intervals must be nonnegative except for `relage_min`
+and `relage_max`, which are signed to support future-dated records. Calendar
+units must match the documented choices. The resulting policy is checked for
+consistency, including sort/group ordering and deduplication dependencies.
+
+Partial configuration is allowed: missing required settings need not all be
+supplied in one command, but must be present before resolving a table for data
+operations. Every effective change across the entire invocation is committed
+atomically in **one snapshot increment**. A validation failure changes nothing;
+an unchanged request does not allocate a snapshot. The command prints the
+resulting snapshot ID and exits nonzero on errors. `dkplus --help` shows usage.
+Connection strings passed as arguments may be visible to other local processes.
+
+The same validated batch operation is available to library callers as
+`dkplus::tags::update(&postgres_config, updates)`, where `updates` is a
+`dkplus::tags::Updates` map of table names to setting names and JSON values.
+Unlike the lower-level `Table::update_tags` API, this operation validates dkplus
+settings and routes timezone/granularity to column tags.
+
+### Resolve policy in library code
+
 Callers own credential/environment parsing. Table policy can live in DuckLake
 tags and be overridden per operation:
 
@@ -204,6 +280,8 @@ DuckLake; use `Table::update_tags` to persist table-level changes.
 | `sort_cols` | Required ascending sort order of repacked files. |
 | `unique_by_cols` | Optional columns defining duplicates; missing/`null` disables deduplication. |
 | `dedup_timestamp` | Optional microsecond timestamp used to choose the retained duplicate. Required when `unique_by_cols` is set. |
+| `granularity` | Spacing of time-column values (`with_granularity`), or `Granularity::Unpredictable`. Required only to find maintenance repacks. |
+| `repack_levels` | Maintenance repack levels (`with_repack_levels`); see [Maintenance repack levels](#maintenance-repack-levels). |
 | `lock_namespace` | Optional explicit lock namespace; defaults to the table name. |
 | `author` | Optional snapshot author override; defaults to an operation/window-derived value. |
 
@@ -222,6 +300,8 @@ The `key` identifies the setting, and `value` is a string containing JSON:
 | `dkplus.sort_cols` | `["station", "observed"]` | Required ascending sort order for repacked files. |
 | `dkplus.unique_by_cols` | `["station", "observed"]` or `null` | Optional duplicate key. When set, dkplus keeps the row selected using `dkplus.dedup_timestamp`. |
 | `dkplus.dedup_timestamp` | `"fetched_at"` or `null` | Optional microsecond timestamp column used to select a retained row for each duplicate key. Required when `unique_by_cols` is set. |
+| `dkplus.granularity` | `"5 minutes"`, `"unpredictable"` or `null` | Time-column tag (table-level fallback) giving the spacing of time values as a Postgres interval. Used by `find_potential_repacks`. |
+| `dkplus.repack_level<N>_<rule>` | `"1 day"`, `"month"` or `null` | Maintenance repack level rules; see below. |
 
 For example, the tag values for a table configured to group and sort by station
 could be:
@@ -234,9 +314,9 @@ dkplus.unique_by_cols   = ["station", "observed"]
 dkplus.dedup_timestamp  = "fetched_at"
 ```
 
-On the `observed` column, set `dkplus.timezone = "America/New_York"` in
-`ducklake_column_tag`, with the value encoded as a JSON string just like table
-tags. Only tags active at the latest snapshot are used. Duplicate active timezone
+On the `observed` column, set `dkplus.timezone = "America/New_York"` (and
+optionally `dkplus.granularity = "5 minutes"`) in `ducklake_column_tag`, with the
+value encoded as a JSON string just like table tags. Only tags active at the latest snapshot are used. Duplicate active timezone
 tags for a column, malformed JSON, and invalid IANA zones fail explicitly.
 
 List values are JSON arrays; nullable optional values can be JSON `null` (for
@@ -391,63 +471,185 @@ deletes are respected, and inlined rows in the window participate in the merge.
 The comparison materializes the input and existing window in memory; boundary
 rewrites use the repack memory budgets.
 
-### 3. Maintenance: discover and repack
+### 3. Maintenance: find and run repacks
 
-`maintenance::discover` finds complete months whose files look like one file per
-day; `Job::run` compacts a range into sorted, optionally deduplicated files
-while preserving snapshots.
+`Table::find_potential_repacks` reads only catalog statistics
+(`ducklake_file_column_stats`), never data files, and returns serializable
+`maintenance::PotentialRepack` groups. Nothing is enqueued or rewritten. Each
+group can be sent to a worker, which runs `maintenance::do_repack` against the
+real data.
 
 ```rust,no_run
-use dkplus::{Table, maintenance, repack};
+use dkplus::{Table, maintenance, repack::Strictness};
 
-async fn compact(table: &Table) -> anyhow::Result<()> {
-    // One-hour granularity: files are expected to span whole hours.
-    let candidates =
-        maintenance::discover(&table.cfg, table, chrono::Duration::hours(1)).await?;
+async fn find(table: &Table) -> anyhow::Result<Vec<String>> {
+    // Serialized repacks can be sent to remote workers.
+    table
+        .find_potential_repacks()
+        .await?
+        .iter()
+        .map(|repack| Ok(serde_json::to_string(repack)?))
+        .collect()
+}
 
-    for c in candidates {
-        // `end` is an inclusive maximum; repack's end date is exclusive.
-        table.repack(c.begin.date(), c.end.date().succ_opt().unwrap())
-            .with_files(c.files)
-            .with_expire_snapshot(repack::ExpireSnapshot::IfNoDedup)
-            .run()
-            .await?;
+async fn work(table: &Table, message: &str) -> anyhow::Result<()> {
+    // `table` is resolved on the worker; the message holds only the plan.
+    let repack: maintenance::PotentialRepack = serde_json::from_str(message)?;
+    match maintenance::do_repack(table, &repack, Strictness::Raise).await? {
+        maintenance::RepackOutcome::Repacked => {}
+        maintenance::RepackOutcome::Skipped(reason) => eprintln!("skipped: {reason}"),
     }
     Ok(())
 }
 ```
 
+`maintenance::find_potential_repacks(&client, &table)` does the same inside a
+caller-owned transaction.
+
+#### Maintenance repack levels
+
+Levels are numbered table tags `dkplus.repack_level<N>_<rule>`, with `N` a
+positive integer without leading zeros. There can be any number of levels. Each
+value is a JSON string (or `null` to ignore the rule). Intervals use Postgres
+interval syntax and are parsed by Postgres when the table resolves. All bounds
+are inclusive.
+
+| Rule | Meaning |
+|---|---|
+| `targetwindow_min`, `targetwindow_max` | Size of the repacked window: `begin + min <= end <= begin + max`. |
+| `sourcewindow_min`, `sourcewindow_max` | The same bounds, applied to each source file's own span. |
+| `age_min`, `age_max` | `now - newest dedup_timestamp >= age_min` and `now - oldest dedup_timestamp <= age_max`, per file. A level with age rules is skipped when the table has no `dedup_timestamp`. Naive dedup timestamps are treated as UTC. |
+| `relage_min`, `relage_max` | Signed bounds on `dedup_timestamp - time_column`, evaluated per file using the conservative min/max checks below. Negative intervals are allowed. A level with relage rules is skipped when the table has no `dedup_timestamp`. |
+| `calendar_begin` | `minute`, `hour`, `day`, `week`, `month`, `quarter` or `year`. The window must start and end on these boundaries in the table timezone. |
+
+`relage` compares the two timestamps directly; unlike `age`, it is not relative
+to the current time. A positive result means the `dedup_timestamp` is later than
+the reported `time_column` (for example, a report ingested today about an event
+from a week ago has a relative age of about `7 days`). A negative result means
+the `time_column` is in the future of the `dedup_timestamp` (for example, a
+forecast for four days from now has a relative age of `-4 days`).
+
+For each file, let `t_min` and `t_max` be the minimum and maximum
+`time_column` statistics, and `d_min` and `d_max` the minimum and maximum
+`dedup_timestamp` statistics. The rules require the entire possible range of
+`dedup_timestamp - time_column` to fit within the configured bounds:
+
+```text
+relage_min: d_min - t_max >= relage_min
+relage_max: d_max - t_min <= relage_max
+```
+
+These are the conservative extremes: the smallest possible difference uses the
+earliest dedup timestamp and latest event time; the largest uses the latest
+dedup timestamp and earliest event time. For example, `relage_min = "6 days"`
+and `relage_max = "8 days"` select only files whose full relative-age range is
+between six and eight days. To select reports about future events four to two
+days ahead, use `relage_min = "-4 days"` and `relage_max = "-2 days"`. Bounds
+are inclusive. For timestamps, negative intervals work in the same way as
+positive ones; `age_min` and `age_max` remain nonnegative and retain their
+separate meaning relative to now.
+
+Window and source-window interval arithmetic follows Postgres
+`timestamptz + interval` in the table timezone. Months and days move the local
+wall clock, so a 23- or 25-hour DST day is still `1 day`. Hours, minutes and
+seconds are elapsed time. `age` and `relage` compare timestamps as UTC instants
+(naive timestamps are treated as UTC); for those comparisons a day is 24 hours,
+and a month is applied using the UTC calendar.
+
+A file covers `[min, max + granularity)`. For example, with a 5-minute
+granularity, an hour is complete when its last file's maximum is `xx:55`. For
+`date` columns, granularity must be whole days.
+
+For each level, the finder:
+
+1. Keeps files that pass the source-window, age, and relage rules.
+2. Sorts them by time and greedily takes the longest contiguous run, with no
+   gaps, that satisfies the target-window and calendar rules.
+3. Accepts the run only if no other current file overlaps the window and the
+   run has at least two files.
+
+With `"unpredictable"` granularity there is no gap check:
+- With `calendar_begin`, a window snaps to calendar boundaries. It is complete
+  once the table holds a value at or after its end.
+- Without `calendar_begin`, a window ends just after its newest value and needs
+  any later value in the table.
+
+Results are ordered by level, then by earliest time value. An entry is dropped
+when any of its files is already used by an earlier kept entry. Finding repacks
+fails if the time column has no granularity or any file lacks time statistics.
+
+```text
+# Full days only, after the day ends.
+dkplus.repack_level1_targetwindow_min = "1 day"
+dkplus.repack_level1_targetwindow_max = "1 day"
+dkplus.repack_level1_calendar_begin   = "day"
+# 1-7 days of week-old data.
+dkplus.repack_level2_age_min          = "7 days"
+dkplus.repack_level2_targetwindow_min = "1 day"
+dkplus.repack_level2_targetwindow_max = "7 days"
+dkplus.repack_level2_calendar_begin   = "day"
+# Calendar months from files that already span at least a day.
+dkplus.repack_level3_sourcewindow_min = "1 day"
+dkplus.repack_level3_targetwindow_min = "1 month"
+dkplus.repack_level3_targetwindow_max = "1 month"
+dkplus.repack_level3_calendar_begin   = "month"
+```
+
+`do_repack` first re-checks the plan against current statistics, using the
+plan's level and granularity. It returns `RepackOutcome::Skipped` when a plan
+file is no longer current, the rules no longer hold, or the window changed.
+Otherwise it repacks `[begin, end)` with the plan's files as a freshness guard.
+Every current file overlapping the window is a source, as with any repack.
+On successful publication, `do_repack` uses `ExpireSnapshot::Referencing`:
+it expires **every catalog snapshot that references a replaced file**, even
+when deduplication is enabled. This removes time travel to those versions for
+**all tables**, not just the repacked table. Snapshots from before the replaced
+files existed are retained. The replaced data and positional-delete files are
+queued for `cleanup_expired_files`; repacking does not physically delete them.
+Skipped or failed repacks do not expire snapshots or queue files.
+`Strictness` controls what happens when that would not produce exactly one file,
+because a source holds rows outside the window:
+
+| Strictness | Behavior |
+|---|---|
+| `Raise` | Fails before reading data if statistics cannot prove every source row is in the window, or if the output would be more than one file. |
+| `Mash` | Writes every row of the selected sources into one file, ignoring the window for splitting. |
+
+#### Ad hoc repacks
+
 `table.repack_now(begin_date, end_date).await?` validates and runs immediately.
 It uses `unique_by_cols` from resolved table metadata (or no deduplication),
 `files: None`, and `ExpireSnapshot::IfNoDedup`.
 
-`table.repack(begin_date, end_date)` returns a `repack::Job` with the same defaults.
-Customize it with `.with_unique(vec![...])`, `.with_files(vec![...])`, and
-`.with_expire_snapshot(policy)`, then `.run().await?`. Validation is automatic;
-calling `validate()` separately is optional.
+`table.repack(begin_date, end_date)?` returns a `repack::Job` between
+table-timezone midnights with the same defaults. `table.repack_between(begin,
+end)` accepts arbitrary `repack::Bound`s. Customize a job with
+`.with_unique(vec![...])`, `.with_files(vec![...])`,
+`.with_expire_snapshot(policy)` and `.with_strictness(strictness)`, then
+`.run().await?`. Validation is automatic; calling `validate()` separately is
+optional.
 
 `repack::Job` options:
 
 | Field | Meaning |
 |---|---|
 | `table` | Resolved `Table`, including config and policy. Serialized only as a qualified table name. |
-| `begin_date`, `end_date` | Calendar dates, `end_date` exclusive. |
+| `begin`, `end` | `Bound::Tz(instant)` for `timestamptz` columns, `Bound::Naive(wall clock)` for `timestamp`/`date` (midnight for `date`); `end` is exclusive. |
 | `unique` | Optional explicit key-column override; if omitted, uses `unique_by_cols` resolved from the `Table`. Configure `Table::builder(...).without_deduplication()` to explicitly disable table-tag deduplication. |
 | `files` | Optional freshness guard of catalog paths; skip if none are current. |
-| `expire_snapshot` | `Never`, `IfNoDedup` (builder/convenience default), or `Always`; see snapshot expiry below. Omitted serialized policies retain the legacy `Never` default. |
-
-For custom transactions use `maintenance::table_candidates(&client, ...)`.
-Candidates are only a heuristic; they enqueue nothing.
+| `expire_snapshot` | `Never`, `IfNoDedup` (builder/convenience default), `Always`, or `Referencing` (`do_repack`); see snapshot expiry below. Omitted serialized policies retain the legacy `Never` default. |
+| `strictness` | Optional `raise` or `mash`; omitted keeps out-of-window rows in separate before/after files. |
 
 ### How repack works
 
 **Selecting sources.** Repack reads the catalog (`ducklake.ducklake_*` tables in
 Postgres) and selects every *current* data file (`end_snapshot IS NULL`) of the
-table whose `Table::time_column` statistics overlap `[begin_date, end_date)`, plus
+table whose `Table::time_column` statistics overlap `[begin, end)`, plus
 files whose min/max/null statistics are missing. File *names* are never parsed and
 no naming convention is assumed; overlap is decided purely from the catalog's
-per-file column min/max. Date boundaries are midnights: `Table::timezone` for
-`timestamptz`, and plain wall-clock midnights for `timestamp`/`date` columns.
+per-file column min/max. `Table::repack` date boundaries are midnights:
+`Table::timezone` for `timestamptz`, and plain wall-clock midnights for
+`timestamp`/`date` columns.
 
 **Rewriting.** Rows are split into three regions: *before* the range, *in-range*,
 and *after* (only the in-range region is deduplicated). Each region is written to
@@ -474,30 +676,38 @@ then:
 Commit conflicts retry up to 6 times; a changed source set or schema fails with a
 "retry the job" error.
 
-**Optional snapshot expiry.** Set `Job::expire_snapshot`:
+**Snapshot expiry.** Set `Job::expire_snapshot` (maintenance `do_repack` sets
+`Referencing` automatically):
 
 | Policy | Behavior |
 |---|---|
-| `ExpireSnapshot::Never` | Default: retain the previous snapshot. |
-| `ExpireSnapshot::IfNoDedup` | Expire only if deduplication is disabled in both the job override and resolved table policy. |
-| `ExpireSnapshot::Always` | Expire even when deduplication changes logical data. |
+| `ExpireSnapshot::Never` | Retain all snapshots. Legacy serialized-job default. |
+| `ExpireSnapshot::IfNoDedup` | Expire the immediate predecessor only if deduplication is disabled in both the job override and resolved table policy. Builder/convenience default. |
+| `ExpireSnapshot::Always` | Expire the immediate predecessor even when deduplication changes logical data. |
+| `ExpireSnapshot::Referencing` | Expire every snapshot referencing a replaced file, including with deduplication. Guarantees replaced files are queued for cleanup. |
 
-Serialized jobs use `"expire_snapshot": "never"`, `"if_no_dedup"` or `"always"`;
-omitting the field preserves the default. Existing Rust `Job` literals must add
+Serialized jobs use `"expire_snapshot": "never"`, `"if_no_dedup"`, `"always"` or
+`"referencing"`; omitting the field preserves the legacy `Never` default. Existing Rust `Job` literals must add
 the field explicitly.
 
-Expiry happens **atomically in the repack publication transaction**: publishing
-snapshot 13 expires its immediate predecessor 12. If unrelated commits happen
+Expiry happens **atomically in the repack publication transaction**. With
+`Always` or enabled `IfNoDedup`, publishing snapshot 13 expires its immediate
+predecessor 12. If unrelated commits happen
 while sorting, the predecessor is the latest snapshot at publication—not the
 snapshot seen when the job started. Conflict retries recompute it. A skipped
 job or failed transaction does not expire anything. `IfNoDedup` means deduplication
 was not requested, not merely that it removed zero rows.
 
-**Snapshot expiry is catalog-wide**: opting in discards time travel to that
-version for every table. It does not expire older versions. Files replaced by
-this repack (including their positional-delete files) are queued for deletion
-only when no retained snapshot needs them. Consequently, expiring 12 does **not**
-necessarily reclaim its input files: snapshots 1–11 might still require them.
+**Snapshot expiry is catalog-wide**: expiring a version discards time travel to
+it for every table. Predecessor-only policies do not expire older versions.
+Consequently, expiring 12 does **not** necessarily reclaim its input files:
+snapshots 1–11 might still require them. `Referencing` instead expires every
+retained snapshot in any replaced file's visibility interval, so none of those
+files remain pinned. For example, a source introduced in snapshot 8 and replaced
+by snapshot 13 requires expiring retained snapshots 8–12, while preserving 0–7
+and the new snapshot 13. Files replaced by this repack (including their
+positional-delete files) are queued for deletion only when no retained snapshot
+needs them.
 Eligible files have their file metadata/statistics removed and absolute paths
 added to DuckLake's deletion queue, with a new scheduling timestamp. Snapshot
 change records are retained for conflict detection. This targeted operation
@@ -511,8 +721,10 @@ publication, so it can temporarily block other writers/cleanup.
 
 **Cleanup.** Repack removes its own temporary sort runs (`<table dir>/_tmp/repack-*/`)
 and any unpublished outputs on failure. It does **not** physically delete retired
-source Parquet files. By default it does not expire snapshots; opt in above or expire them through DuckLake,
-then use `maintenance::cleanup_expired_files` (below) for queued files.
+source Parquet files. Maintenance `do_repack` expires referencing snapshots;
+ad hoc builders default to predecessor expiry only when deduplication is disabled.
+Use `Never` to retain snapshots, or expire them through DuckLake, then use
+`maintenance::cleanup_expired_files` (below) for queued files.
 After an uncertain commit failure candidate outputs
 are deliberately kept.
 
@@ -588,8 +800,10 @@ the catalog. The dedup timestamp must be a microsecond timestamp.
 
 `maintenance::cleanup_expired_files` physically deletes files from DuckLake's
 `ducklake.ducklake_files_scheduled_for_deletion` queue. **Retired is not expired:**
-files retired by repack can still belong to retained snapshots. Expire those
-snapshots through DuckLake or opt in to repack's predecessor expiry first;
+files retired by repack can still belong to retained snapshots. Maintenance
+`do_repack` expires all snapshots referencing its replaced files automatically.
+For ad hoc jobs, use `ExpireSnapshot::Referencing` for the same guarantee, or
+expire the necessary snapshots through DuckLake first;
 this function does not expire snapshots, scan
 for orphaned files, or remove abandoned repack output.
 
@@ -627,6 +841,9 @@ async fn cleanup(cfg: &Config) -> anyhow::Result<()> {
 - `older_than` is a **strict cutoff on `schedule_start`**, not file modification
   time or snapshot time. Choose a delay longer than any active read transaction;
   seven days above is an example, not an automatically enforced safety period.
+  Files queued during repack become eligible only when `older_than` is strictly
+  later than their queue timestamp. A cutoff from before that repack will not
+  delete them, regardless of how old the original files were.
 - `dry_run` resolves and validates candidates without deleting objects or queue
   entries. The preview is not reserved: the subsequent call reselects candidates.
 - `CleanupReport::files` lists selected IDs, absolute paths, and schedule times.
@@ -694,19 +911,13 @@ flushed before repacking.
 
 ## Maintenance
 
-`maintenance::discover(&table.cfg, &table, granularity)` returns candidates
-without enqueueing anything. `table_candidates` can use a caller-owned transaction.
-Each table discovery materializes stats in a separate statement before timestamp
-casts, preserving temporary-table cleanup and avoiding casts of unrelated stats.
-The monthly heuristic selects midnight-to-hour-23 file bounds, first-of-month
-minimum, and a file count equal to the month's day count. Date maxima represent
-whole inclusive days. This is not proof of contiguous data or one file per day.
-Granularity must be positive whole seconds, or whole days for date columns.
-Callers choose reports, turn inclusive maxima into exclusive end dates, schedule,
-and deliver jobs. Serialized `Job` includes only the qualified table name, dates,
-and operation options, never config or policy. After deserializing, assign a
-freshly resolved `Table` to `job.table` before calling `job.run().await?`;
-unresolved queued jobs fail validation rather than trusting queue messages to
+`find_potential_repacks` returns plans without enqueueing anything. Callers
+choose reports, schedule, and deliver plans or jobs. Serialized
+`PotentialRepack` and `Job` values include only the qualified table name, bounds,
+rules and operation options, never config or policy. After deserializing a job,
+assign a freshly resolved `Table` to `job.table` before calling
+`job.run().await?`. For plans, pass a freshly resolved `Table` to `do_repack`.
+Unresolved queued jobs fail validation rather than trusting queue messages to
 configure storage. Credentials and callbacks are not serialized.
 
 ## Verification

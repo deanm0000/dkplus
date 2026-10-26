@@ -1,3 +1,4 @@
+use crate::maintenance::{Granularity, RepackLevel};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -160,6 +161,10 @@ pub struct Table {
     pub sort_cols: Vec<String>,
     pub unique_by_cols: Option<Vec<String>>,
     pub dedup_timestamp: Option<String>,
+    /// Spacing of time-column values; required to find maintenance repacks.
+    pub granularity: Option<Granularity>,
+    /// Maintenance repack levels, ordered by level number.
+    pub repack_levels: Vec<RepackLevel>,
     pub author: Option<String>,
     pub lock_namespace: String,
 }
@@ -188,6 +193,8 @@ impl Default for Table {
             sort_cols: vec!["time".into()],
             unique_by_cols: None,
             dedup_timestamp: None,
+            granularity: None,
+            repack_levels: Vec::new(),
             author: None,
             lock_namespace: String::new(),
         }
@@ -212,6 +219,8 @@ pub struct TableBuilder {
     pub(crate) sort_cols: Option<Vec<String>>,
     pub(crate) unique_by_cols: Option<Option<Vec<String>>>,
     pub(crate) dedup_timestamp: Option<Option<String>>,
+    pub(crate) granularity: Option<Granularity>,
+    pub(crate) repack_levels: Option<Vec<RepackLevel>>,
     pub(crate) author: Option<String>,
     pub(crate) lock_namespace: Option<String>,
 }
@@ -236,6 +245,8 @@ impl TableBuilder {
             sort_cols: None,
             unique_by_cols: None,
             dedup_timestamp: None,
+            granularity: None,
+            repack_levels: None,
             author: None,
             lock_namespace: None,
         }
@@ -279,6 +290,17 @@ impl TableBuilder {
 
     pub fn with_dedup_timestamp(mut self, name: impl Into<String>) -> Self {
         self.dedup_timestamp = Some(Some(name.into()));
+        self
+    }
+
+    pub fn with_granularity(mut self, granularity: Granularity) -> Self {
+        self.granularity = Some(granularity);
+        self
+    }
+
+    /// Replace every tag-defined repack level.
+    pub fn with_repack_levels(mut self, levels: Vec<RepackLevel>) -> Self {
+        self.repack_levels = Some(levels);
         self
     }
 
@@ -331,6 +353,25 @@ impl Table {
         }
         if let Some(name) = &self.dedup_timestamp {
             identifier(name)?;
+        }
+        if let Some(Granularity::Fixed(step)) = self.granularity {
+            if step.is_zero() || !step.is_non_negative() {
+                bail!("granularity must be a positive interval");
+            }
+            if self.time_type == TimeType::Date && step.micros != 0 {
+                bail!("date granularity must be a whole number of days or months");
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for level in &self.repack_levels {
+            if level.level == 0 || !seen.insert(level.level) {
+                bail!("repack level numbers must be positive and distinct");
+            }
+            for (rule, value) in level.intervals() {
+                if !matches!(rule, "relage_min" | "relage_max") && !value.is_non_negative() {
+                    bail!("repack level {} {rule} must not be negative", level.level);
+                }
+            }
         }
         Ok(())
     }
@@ -387,6 +428,7 @@ pub(crate) fn identifier(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::maintenance::Interval;
 
     #[test]
     fn builders_retain_their_config() {
@@ -431,6 +473,23 @@ mod tests {
             (table.midnight(end).unwrap() - table.midnight(start).unwrap()).num_days(),
             1
         );
+    }
+
+    #[test]
+    fn relative_age_rules_allow_signed_intervals() {
+        let mut table = Table {
+            table: "records".into(),
+            repack_levels: vec![RepackLevel {
+                relage_min: Some(Interval::days(-7)),
+                relage_max: Some(Interval::days(-1)),
+                ..RepackLevel::new(1)
+            }],
+            ..Table::default()
+        };
+        assert!(table.validate().is_ok());
+
+        table.repack_levels[0].age_min = Some(Interval::days(-1));
+        assert!(table.validate().is_err());
     }
 
     #[test]
