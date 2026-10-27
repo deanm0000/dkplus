@@ -316,62 +316,8 @@ fn overridden_tag<T: serde::de::DeserializeOwned>(
     }
 }
 
-/// Active `dkplus.timezone` and `dkplus.granularity` column tags, keyed by
-/// column ID and then tag key.
-type ColumnTags = HashMap<i64, HashMap<String, String>>;
-
-async fn column_tags(c: &impl GenericClient, table_id: i64) -> Result<ColumnTags> {
-    let rows = c
-        .query(
-            "SELECT tag.column_id, tag.key, tag.value
-               FROM ducklake.ducklake_column_tag tag
-               CROSS JOIN LATERAL (
-                   SELECT max(snapshot_id) AS snapshot_id
-                     FROM ducklake.ducklake_snapshot
-               ) latest
-              WHERE tag.table_id = $1 AND tag.key IN ('dkplus.timezone', 'dkplus.granularity')
-                AND tag.begin_snapshot <= latest.snapshot_id
-                AND (tag.end_snapshot IS NULL OR tag.end_snapshot > latest.snapshot_id)",
-            &[&table_id],
-        )
-        .await
-        .context("reading active DuckLake column tags")?;
-    let mut tags: ColumnTags = HashMap::new();
-    for row in rows {
-        let column_id: i64 = row.get(0);
-        let key: String = row.get(1);
-        if tags
-            .entry(column_id)
-            .or_default()
-            .insert(key.clone(), row.get(2))
-            .is_some()
-        {
-            fail!(
-                InvalidData,
-                "multiple active DuckLake {key:?} tags for column {column_id}"
-            );
-        }
-    }
-    Ok(tags)
-}
-
-/// A column tag, falling back to the same table-level key.
-fn time_column_tag<'a>(
-    tags: &'a HashMap<String, String>,
-    column_tags: &'a ColumnTags,
-    column_id: i64,
-    key: &str,
-) -> Option<(&'a String, bool)> {
-    column_tags
-        .get(&column_id)
-        .and_then(|tags| tags.get(key))
-        .map(|value| (value, true))
-        .or_else(|| tags.get(key).map(|value| (value, false)))
-}
-
-fn decode_tag<T: serde::de::DeserializeOwned>(value: &str, key: &str, column: bool) -> Result<T> {
-    let kind = if column { "column tag" } else { "tag" };
-    serde_json::from_str(value).with_context(|| format!("decoding DuckLake {kind} {key:?}"))
+fn decode_tag<T: serde::de::DeserializeOwned>(value: &str, key: &str) -> Result<T> {
+    serde_json::from_str(value).with_context(|| format!("decoding DuckLake tag {key:?}"))
 }
 
 /// `(key, rule, value)` tag entries keyed by repack level number.
@@ -412,20 +358,10 @@ const LEVEL_INTERVAL_RULES: [&str; 8] = [
 ];
 
 /// Interval texts that tag resolution will need, parsed by Postgres.
-fn interval_texts(
-    builder: &TableBuilder,
-    meta: &TableMeta,
-    tags: &HashMap<String, String>,
-    column_tags: &ColumnTags,
-) -> Result<Vec<String>> {
+fn interval_texts(builder: &TableBuilder, tags: &HashMap<String, String>) -> Result<Vec<String>> {
     let mut texts = Vec::new();
     if builder.granularity.is_none()
-        && let Some(time_column) =
-            overridden_tag(builder.time_column.clone(), tags, TAG_TIME_COLUMN)?
-        && let Some(column) = meta.columns.get(&time_column)
-        && let Some((value, column)) =
-            time_column_tag(tags, column_tags, column.id, TAG_GRANULARITY)
-        && let Some(text) = decode_tag::<Option<String>>(value, TAG_GRANULARITY, column)?
+        && let Some(text) = tag_value::<Option<String>>(tags, TAG_GRANULARITY)?.flatten()
         && text != UNPREDICTABLE
     {
         texts.push(text);
@@ -433,7 +369,7 @@ fn interval_texts(
     if builder.repack_levels.is_none() {
         for (key, rule, value) in level_tags(tags)?.into_values().flatten() {
             if LEVEL_INTERVAL_RULES.contains(&rule)
-                && let Some(text) = decode_tag::<Option<String>>(value, key, false)?
+                && let Some(text) = decode_tag::<Option<String>>(value, key)?
             {
                 texts.push(text);
             }
@@ -487,7 +423,7 @@ fn resolve_levels(
     for (number, rules) in level_tags(tags)? {
         let mut level = maintenance::RepackLevel::new(number);
         for (key, rule, value) in rules {
-            let Some(text) = decode_tag::<Option<String>>(value, key, false)? else {
+            let Some(text) = decode_tag::<Option<String>>(value, key)? else {
                 continue;
             };
             let slot = match rule {
@@ -530,24 +466,21 @@ pub(crate) async fn resolve_table(builder: TableBuilder) -> Result<Table> {
         .await?;
     let meta = table_meta(&tx, &builder.schema, &builder.table).await?;
     let tags = table_tags(&tx, meta.table_id).await?;
-    let column_tags = column_tags(&tx, meta.table_id).await?;
-    let intervals =
-        parse_intervals(&tx, interval_texts(&builder, &meta, &tags, &column_tags)?).await?;
+    let intervals = parse_intervals(&tx, interval_texts(&builder, &tags)?).await?;
     tx.commit()
         .await
         .context("finishing table policy read transaction")?;
-    resolve_table_settings(builder, &meta, &tags, &column_tags, &intervals)
+    resolve_table_settings(builder, &meta, &tags, &intervals)
 }
 
 fn resolve_table_settings(
     builder: TableBuilder,
     meta: &TableMeta,
     tags: &HashMap<String, String>,
-    column_tags: &ColumnTags,
     intervals: &HashMap<String, maintenance::Interval>,
 ) -> Result<Table> {
     let name = format!("{}.{}", builder.schema, builder.table);
-    resolve_table_settings_inner(builder, meta, tags, column_tags, intervals)
+    resolve_table_settings_inner(builder, meta, tags, intervals)
         .map_err(|error| error.for_table(name))
 }
 
@@ -555,7 +488,6 @@ fn resolve_table_settings_inner(
     builder: TableBuilder,
     meta: &TableMeta,
     tags: &HashMap<String, String>,
-    column_tags: &ColumnTags,
     intervals: &HashMap<String, maintenance::Interval>,
 ) -> Result<Table> {
     let name = format!("{}.{}", builder.schema, builder.table);
@@ -572,9 +504,7 @@ fn resolve_table_settings_inner(
         .with_context(|| format!("table has no configured time column {time_column:?}"))?;
     let timezone = match builder.timezone {
         Some(timezone) => timezone,
-        None => time_column_tag(tags, column_tags, time_col.id, TAG_TIMEZONE)
-            .map(|(value, column)| decode_tag::<String>(value, TAG_TIMEZONE, column))
-            .transpose()?
+        None => tag_value::<String>(tags, TAG_TIMEZONE)?
             .map(|zone| {
                 zone.parse::<chrono_tz::Tz>()
                     .with_context(|| format!("invalid timezone tag {zone:?}"))
@@ -599,11 +529,7 @@ fn resolve_table_settings_inner(
         overridden_tag(builder.dedup_timestamp, tags, TAG_DEDUP_TIMESTAMP)?.unwrap_or(None);
     let granularity = match builder.granularity {
         Some(granularity) => Some(granularity),
-        None => match time_column_tag(tags, column_tags, time_col.id, TAG_GRANULARITY)
-            .map(|(value, column)| decode_tag::<Option<String>>(value, TAG_GRANULARITY, column))
-            .transpose()?
-            .flatten()
-        {
+        None => match tag_value::<Option<String>>(tags, TAG_GRANULARITY)?.flatten() {
             Some(text) if text == UNPREDICTABLE => Some(maintenance::Granularity::Unpredictable),
             Some(text) => Some(maintenance::Granularity::Fixed(interval(intervals, &text)?)),
             None => None,
@@ -1633,7 +1559,6 @@ mod tests {
             &meta,
             &tags,
             &HashMap::new(),
-            &HashMap::new(),
         )
         .unwrap();
 
@@ -1650,24 +1575,19 @@ mod tests {
         assert_eq!(table.lock_namespace, "weather.repack");
         assert_eq!(table.author, None);
 
-        let from_column = resolve_table_settings(
+        let mut valid_tags = tags.clone();
+        valid_tags.insert(TAG_TIMEZONE.into(), r#""America/New_York""#.into());
+        let from_tags = resolve_table_settings(
             Table::default()
                 .cfg
                 .table_builder("weather.observations")
                 .with_time_column("observed"),
             &meta,
-            &tags,
-            &HashMap::from([
-                (
-                    1,
-                    HashMap::from([(TAG_TIMEZONE.into(), r#""America/New_York""#.into())]),
-                ),
-                (2, HashMap::from([(TAG_TIMEZONE.into(), "not-json".into())])),
-            ]),
+            &valid_tags,
             &HashMap::new(),
         )
         .unwrap();
-        assert_eq!(from_column.timezone, chrono_tz::America::New_York);
+        assert_eq!(from_tags.timezone, chrono_tz::America::New_York);
 
         let optional_overrides = resolve_table_settings(
             Table::builder("weather.observations", &Table::default().cfg)
@@ -1678,7 +1598,6 @@ mod tests {
                 .without_deduplication(),
             &meta,
             &tags,
-            &HashMap::new(),
             &HashMap::new(),
         )
         .unwrap();
@@ -1719,7 +1638,6 @@ mod tests {
                 Table::builder("weather.observations", &Table::default().cfg),
                 &meta,
                 &tags,
-                &HashMap::new(),
                 &HashMap::new(),
             )
             .unwrap_err();
@@ -1773,25 +1691,18 @@ mod tests {
                 "null".into(),
             ),
         ]);
-        let column_tags = HashMap::from([(
-            1,
-            HashMap::from([(TAG_GRANULARITY.into(), r#""5 minutes""#.into())]),
-        )]);
         let builder = || Table::builder("weather.observations", &Table::default().cfg);
-        let texts = interval_texts(&builder(), &meta, &tags, &column_tags).unwrap();
-        assert_eq!(texts, ["1 day", "5 minutes", "7 days"]);
+        let texts = interval_texts(&builder(), &tags).unwrap();
+        assert_eq!(texts, ["1 day", "1 hour", "7 days"]);
         let intervals = HashMap::from([
             ("1 hour".to_string(), Interval::hours(1)),
-            ("5 minutes".to_string(), Interval::minutes(5)),
             ("1 day".to_string(), Interval::days(1)),
             ("7 days".to_string(), Interval::days(7)),
         ]);
-        let table =
-            resolve_table_settings(builder(), &meta, &tags, &column_tags, &intervals).unwrap();
-        // The column tag wins over the table tag.
+        let table = resolve_table_settings(builder(), &meta, &tags, &intervals).unwrap();
         assert_eq!(
             table.granularity,
-            Some(Granularity::Fixed(Interval::minutes(5)))
+            Some(Granularity::Fixed(Interval::hours(1)))
         );
         assert_eq!(
             table.repack_levels,
@@ -1809,15 +1720,8 @@ mod tests {
                 },
             ]
         );
-        let table =
-            resolve_table_settings(builder(), &meta, &tags, &HashMap::new(), &intervals).unwrap();
-        assert_eq!(
-            table.granularity,
-            Some(Granularity::Fixed(Interval::hours(1)))
-        );
         tags.insert(TAG_GRANULARITY.into(), r#""unpredictable""#.into());
-        let table =
-            resolve_table_settings(builder(), &meta, &tags, &HashMap::new(), &intervals).unwrap();
+        let table = resolve_table_settings(builder(), &meta, &tags, &intervals).unwrap();
         assert_eq!(table.granularity, Some(Granularity::Unpredictable));
 
         for (key, value, message) in [
@@ -1844,8 +1748,7 @@ mod tests {
         ] {
             let mut bad = tags.clone();
             bad.insert(key.into(), value.into());
-            let error = resolve_table_settings(builder(), &meta, &bad, &HashMap::new(), &intervals)
-                .unwrap_err();
+            let error = resolve_table_settings(builder(), &meta, &bad, &intervals).unwrap_err();
             assert!(format!("{error:#}").contains(message), "{key}: {error:#}");
         }
     }

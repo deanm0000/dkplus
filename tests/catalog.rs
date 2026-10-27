@@ -232,7 +232,7 @@ async fn typed_errors_preserve_catalog_sources_and_retry_exhaustion() {
 
 #[tokio::test]
 #[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
-async fn column_timezone_resolves_from_active_metadata_and_can_be_overridden() {
+async fn table_timezone_resolves_from_active_metadata_and_ignores_column_tags() {
     let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
         .unwrap()
         .parse()
@@ -250,13 +250,18 @@ async fn column_timezone_resolves_from_active_metadata_and_can_be_overridden() {
              INSERT INTO ducklake.ducklake_tag VALUES
                  (1,0,NULL,'dkplus.time_column','\"observed\"'),
                  (1,0,NULL,'dkplus.sort_cols','[\"observed\"]'),
-                 (1,0,NULL,'dkplus.timezone','\"UTC\"');
+                 (1,0,0,'dkplus.timezone','\"Not/AZone\"'),
+                 (1,1,NULL,'dkplus.timezone','\"Not/AZone\"'),
+                 (1,0,NULL,'dkplus.timezone','\"America/New_York\"'),
+                 (1,0,NULL,'dkplus.granularity','\"5 minutes\"'),
+                 (2,0,NULL,'dkplus.timezone','\"Not/AZone\"');
              INSERT INTO ducklake.ducklake_column_tag VALUES
                  (1,1,0,0,'dkplus.timezone','\"Not/AZone\"'),
                  (1,1,1,NULL,'dkplus.timezone','\"Not/AZone\"'),
-                 (1,1,0,NULL,'dkplus.timezone','\"America/New_York\"'),
+                 (1,1,0,NULL,'dkplus.timezone','\"Not/AZone\"'),
                  (1,2,0,NULL,'dkplus.timezone','\"Asia/Tokyo\"'),
-                 (2,1,0,NULL,'dkplus.timezone','\"Not/AZone\"');",
+                 (2,1,0,NULL,'dkplus.timezone','\"Not/AZone\"'),
+                 (1,1,0,NULL,'dkplus.granularity','not-json');",
         )
         .await
         .unwrap();
@@ -268,19 +273,21 @@ async fn column_timezone_resolves_from_active_metadata_and_can_be_overridden() {
         cfg.table("weather.observations").await.unwrap().timezone,
         chrono_tz::America::New_York
     );
-    client
-        .batch_execute("DELETE FROM ducklake.ducklake_tag WHERE key = 'dkplus.timezone'")
-        .await
-        .unwrap();
     let resolved = cfg.table("weather.observations").await.unwrap();
     assert_eq!(resolved.timezone, chrono_tz::America::New_York);
+    assert_eq!(
+        resolved.granularity,
+        Some(dkplus::maintenance::Granularity::Fixed(
+            dkplus::maintenance::Interval::minutes(5)
+        ))
+    );
     let other_column = cfg
         .table_builder("weather.observations")
         .with_time_column("fetched")
         .resolve()
         .await
         .unwrap();
-    assert_eq!(other_column.timezone, chrono_tz::Asia::Tokyo);
+    assert_eq!(other_column.timezone, chrono_tz::America::New_York);
     let explicit = Table::builder("weather.observations", &cfg)
         .with_timezone(chrono_tz::Europe::London)
         .resolve()
@@ -291,8 +298,8 @@ async fn column_timezone_resolves_from_active_metadata_and_can_be_overridden() {
     for value in ["not-json", "\"Not/AZone\"", "null"] {
         client
             .execute(
-                "UPDATE ducklake.ducklake_column_tag SET value = $1
-                  WHERE table_id = 1 AND column_id = 1
+                "UPDATE ducklake.ducklake_tag SET value = $1
+                  WHERE object_id = 1 AND key = 'dkplus.timezone'
                     AND begin_snapshot = 0 AND end_snapshot IS NULL",
                 &[&value],
             )
@@ -309,8 +316,8 @@ async fn column_timezone_resolves_from_active_metadata_and_can_be_overridden() {
     }
     client
         .batch_execute(
-            "INSERT INTO ducklake.ducklake_column_tag VALUES
-                 (1,1,0,NULL,'dkplus.timezone','\"UTC\"');",
+            "INSERT INTO ducklake.ducklake_tag VALUES
+                 (1,0,NULL,'dkplus.timezone','\"UTC\"');",
         )
         .await
         .unwrap();
@@ -323,7 +330,7 @@ async fn column_timezone_resolves_from_active_metadata_and_can_be_overridden() {
     );
     client
         .batch_execute(
-            "DELETE FROM ducklake.ducklake_column_tag WHERE table_id = 1 AND column_id = 1",
+            "DELETE FROM ducklake.ducklake_tag WHERE object_id = 1 AND key = 'dkplus.timezone'",
         )
         .await
         .unwrap();
@@ -345,6 +352,11 @@ async fn column_timezone_resolves_from_active_metadata_and_can_be_overridden() {
         cfg.table("weather.observations").await.unwrap().timezone,
         chrono_tz::UTC
     );
+    client
+        .batch_execute("DROP TABLE ducklake.ducklake_column_tag")
+        .await
+        .unwrap();
+    assert!(cfg.table("weather.observations").await.is_ok());
 
     client
         .batch_execute("DROP SCHEMA ducklake CASCADE")
@@ -666,7 +678,8 @@ async fn cli_policy_updates_are_validated_and_atomic_across_tables() {
             "INSERT INTO ducklake.ducklake_table VALUES
              (1,1,'observations','observations/',true,NULL),
              (2,1,'forecast','forecast/',true,NULL),
-             (3,1,'dates','dates/',true,NULL);
+             (3,1,'dates','dates/',true,NULL),
+             (4,1,'partial','partial/',true,NULL);
          INSERT INTO ducklake.ducklake_column VALUES
              (1,1,'observed','timestamptz',NULL,NULL),
              (1,2,'station','int32',NULL,NULL),
@@ -739,8 +752,9 @@ async fn cli_policy_updates_are_validated_and_atomic_across_tables() {
     assert_eq!(
         count(
             &client,
-            "SELECT count(*) FROM ducklake.ducklake_column_tag
-          WHERE begin_snapshot=2 AND end_snapshot IS NULL"
+            "SELECT count(*) FROM ducklake.ducklake_tag
+          WHERE key IN ('dkplus.timezone', 'dkplus.granularity')
+            AND begin_snapshot=2 AND end_snapshot IS NULL"
         )
         .await,
         4
@@ -749,7 +763,7 @@ async fn cli_policy_updates_are_validated_and_atomic_across_tables() {
         count(
             &client,
             "SELECT count(*) FROM ducklake.ducklake_tag
-          WHERE key='dkplus.timezone' AND begin_snapshot=0 AND end_snapshot IS NULL"
+          WHERE key='dkplus.timezone' AND begin_snapshot=0 AND end_snapshot=2"
         )
         .await,
         1
@@ -794,7 +808,6 @@ async fn cli_policy_updates_are_validated_and_atomic_across_tables() {
         serde_json::json!({"weather.forecast": {"repack_level1_calendar_begin": "fortnight"}}),
         serde_json::json!({"weather.observations": {"sort_cols": ["observed", "station"]}}),
         serde_json::json!({"weather.dates": {"time_column": "observed", "granularity": "1 hour"}}),
-        serde_json::json!({"weather.dates": {"timezone": "UTC"}}),
         serde_json::json!({"weather.observations": {"timezone": "UTC"}, "weather.zzmissing": {"time_column": "observed"}}),
     ] {
         let error =
@@ -813,7 +826,7 @@ async fn cli_policy_updates_are_validated_and_atomic_across_tables() {
         );
         assert_eq!(
             count(&client, "SELECT count(*) FROM ducklake.ducklake_column_tag").await,
-            4,
+            0,
             "{invalid}"
         );
     }
@@ -830,8 +843,8 @@ async fn cli_policy_updates_are_validated_and_atomic_across_tables() {
     assert_eq!(
         count(
             &client,
-            "SELECT count(*) FROM ducklake.ducklake_column_tag
-          WHERE table_id=1 AND key='dkplus.timezone' AND begin_snapshot=2 AND end_snapshot=3"
+            "SELECT count(*) FROM ducklake.ducklake_tag
+          WHERE object_id=1 AND key='dkplus.timezone' AND begin_snapshot=2 AND end_snapshot=3"
         )
         .await,
         1
@@ -858,17 +871,46 @@ async fn cli_policy_updates_are_validated_and_atomic_across_tables() {
     assert_eq!(
         count(
             &client,
-            "SELECT count(*) FROM ducklake.ducklake_column_tag
-          WHERE table_id=1 AND column_id=3 AND begin_snapshot=4 AND end_snapshot IS NULL"
+            "SELECT count(*) FROM ducklake.ducklake_tag
+          WHERE object_id=1 AND key IN ('dkplus.timezone', 'dkplus.granularity')
+            AND begin_snapshot=4 AND end_snapshot IS NULL"
         )
         .await,
-        2
+        1
     );
     assert_eq!(
         count(
             &client,
             "SELECT count(*) FROM ducklake.ducklake_column_tag
-          WHERE table_id=1 AND column_id=1 AND end_snapshot IS NULL"
+          WHERE table_id=1 AND end_snapshot IS NULL"
+        )
+        .await,
+        0
+    );
+    client
+        .batch_execute("DROP TABLE ducklake.ducklake_column_tag")
+        .await
+        .unwrap();
+    let updates = serde_json::json!({
+        "weather.partial": {"timezone": "UTC", "granularity": "1 hour"}
+    });
+    assert_eq!(
+        dkplus::tags::update(&postgres, serde_json::from_value(updates.clone()).unwrap())
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        dkplus::tags::update(&postgres, serde_json::from_value(updates).unwrap())
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.ducklake_tag
+             WHERE object_id=4 AND begin_snapshot=5 AND end_snapshot IS NULL"
         )
         .await,
         2
@@ -2207,7 +2249,7 @@ async fn exercise_catalog(storage: Storage) {
         }
         client
             .execute(
-                "INSERT INTO ducklake.ducklake_column_tag VALUES ($1,1,0,NULL,'dkplus.granularity',$2)",
+                "INSERT INTO ducklake.ducklake_tag VALUES ($1,0,NULL,'dkplus.granularity',$2)",
                 &[&discovery_id, &format!("{granularity:?}")],
             )
             .await

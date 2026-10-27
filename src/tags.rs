@@ -62,7 +62,6 @@ async fn validate(
     table: &str,
     meta: &TableMeta,
     tags: &HashMap<String, String>,
-    columns: &ColumnTags,
 ) -> Result<()> {
     let time: Option<String> = tag_value(tags, TAG_TIME_COLUMN)?;
     let time_col = time
@@ -134,21 +133,12 @@ async fn validate(
             "dedup timestamp column {name:?} must be a microsecond timestamp"
         );
     }
-    let effective = |key| {
-        time_col
-            .and_then(|col| time_column_tag(tags, columns, col.id, key))
-            .or_else(|| tags.get(key).map(|value| (value, false)))
-    };
-    if let Some((value, column)) = effective(TAG_TIMEZONE) {
-        let zone: String = decode_tag(value, TAG_TIMEZONE, column)?;
+    if let Some(zone) = tag_value::<String>(tags, TAG_TIMEZONE)? {
         policy.timezone = zone
             .parse()
             .with_context(|| format!("invalid timezone {zone:?}"))?;
     }
-    let granularity = effective(TAG_GRANULARITY)
-        .map(|(value, column)| decode_tag::<Option<String>>(value, TAG_GRANULARITY, column))
-        .transpose()?
-        .flatten();
+    let granularity = tag_value::<Option<String>>(tags, TAG_GRANULARITY)?.flatten();
     let mut texts = Vec::new();
     if let Some(text) = &granularity
         && text != UNPREDICTABLE
@@ -157,7 +147,7 @@ async fn validate(
     }
     for (key, rule, value) in level_tags(tags)?.into_values().flatten() {
         if LEVEL_INTERVAL_RULES.contains(&rule)
-            && let Some(text) = decode_tag::<Option<String>>(value, key, false)?
+            && let Some(text) = decode_tag::<Option<String>>(value, key)?
         {
             texts.push(text);
         }
@@ -180,7 +170,6 @@ async fn validate(
 
 struct Change {
     table_id: i64,
-    column_id: Option<i64>,
     key: String,
     value: String,
     replace: bool,
@@ -190,7 +179,7 @@ struct Change {
 ///
 /// Tables must be qualified as `schema.table`. Column references and the
 /// resulting partial policy are validated before any writes. Timezone and
-/// granularity are column tags on the new or existing `time_column`.
+/// granularity, like all settings, are table tags in `ducklake_tag`.
 /// Returns the current snapshot without incrementing it for a no-op.
 /// This operation needs no object-store credentials.
 pub async fn update(postgres: &tokio_postgres::Config, updates: Updates) -> Result<i64> {
@@ -272,44 +261,18 @@ pub async fn update(postgres: &tokio_postgres::Config, updates: Updates) -> Resu
             );
         }
         let mut active = table_tags(&tx, table_id).await?;
-        let mut columns = column_tags(&tx, table_id).await?;
-        let mut effective = active.clone();
-        effective.extend(requested.clone());
-        let time: Option<String> = tag_value(&effective, TAG_TIME_COLUMN)?;
         for (key, value) in requested {
-            let column_id = if key == TAG_TIMEZONE || key == TAG_GRANULARITY {
-                let time = time.as_ref().ok_or_else(|| Error::MissingRequiredSetting {
-                    table: name.clone(),
-                    setting: "time_column",
-                })?;
-                Some(
-                    meta.columns
-                        .get(time)
-                        .ok_or_else(|| Error::InvalidConfiguration {
-                            table: name.clone(),
-                            reason: format!("column {time:?} does not exist"),
-                        })?
-                        .id,
-                )
-            } else {
-                None
-            };
-            let target = match column_id {
-                Some(id) => columns.entry(id).or_default(),
-                None => &mut active,
-            };
-            if target.get(&key) != Some(&value) {
-                let replace = target.insert(key.clone(), value.clone()).is_some();
+            if active.get(&key) != Some(&value) {
+                let replace = active.insert(key.clone(), value.clone()).is_some();
                 changes.push(Change {
                     table_id,
-                    column_id,
                     key,
                     value,
                     replace,
                 });
             }
         }
-        validate(&tx, &schema, &table, &meta, &active, &columns)
+        validate(&tx, &schema, &table, &meta, &active)
             .await
             .with_context(|| format!("validating policy for {name}"))
             .map_err(|error| error.for_table(&name))?;
@@ -352,50 +315,31 @@ pub async fn update(postgres: &tokio_postgres::Config, updates: Updates) -> Resu
     for change in changes {
         let Change {
             table_id,
-            column_id,
             key,
             value,
             replace,
         } = change;
         if replace {
-            let ended = match column_id {
-                Some(id) => {
-                    tx.execute(
-                        "UPDATE ducklake.ducklake_column_tag SET end_snapshot = $5
-                      WHERE table_id = $1 AND column_id = $2 AND key = $3
-                        AND begin_snapshot <= $4 AND (end_snapshot IS NULL OR end_snapshot > $4)",
-                        &[&table_id, &id, &key, &previous, &snapshot],
-                    )
-                    .await
-                }
-                None => {
-                    tx.execute(
-                        "UPDATE ducklake.ducklake_tag SET end_snapshot = $4
+            let ended = tx
+                .execute(
+                    "UPDATE ducklake.ducklake_tag SET end_snapshot = $4
                       WHERE object_id = $1 AND key = $2
                         AND begin_snapshot <= $3 AND (end_snapshot IS NULL OR end_snapshot > $3)",
-                        &[&table_id, &key, &previous, &snapshot],
-                    )
-                    .await
-                }
-            }
-            .with_context(|| format!("ending active tag {key:?}"))?;
+                    &[&table_id, &key, &previous, &snapshot],
+                )
+                .await
+                .with_context(|| format!("ending active tag {key:?}"))?;
             if ended != 1 {
                 fail!(CatalogChanged, "active tag {key:?} changed during update");
             }
         }
-        match column_id {
-            Some(id) => tx.execute(
-                "INSERT INTO ducklake.ducklake_column_tag
-                   (table_id, column_id, begin_snapshot, end_snapshot, key, value)
-                 VALUES ($1, $2, $3, NULL, $4, $5)",
-                &[&table_id, &id, &snapshot, &key, &value]
-            ).await,
-            None => tx.execute(
-                "INSERT INTO ducklake.ducklake_tag (object_id, begin_snapshot, end_snapshot, key, value)
-                 VALUES ($1, $2, NULL, $3, $4)",
-                &[&table_id, &snapshot, &key, &value]
-            ).await,
-        }.with_context(|| format!("writing tag {key:?}"))?;
+        tx.execute(
+            "INSERT INTO ducklake.ducklake_tag (object_id, begin_snapshot, end_snapshot, key, value)
+             VALUES ($1, $2, NULL, $3, $4)",
+            &[&table_id, &snapshot, &key, &value],
+        )
+        .await
+        .with_context(|| format!("writing tag {key:?}"))?;
     }
     tx.commit().await.context("committing policy snapshot")?;
     Ok(snapshot)

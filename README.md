@@ -110,11 +110,10 @@ ordinary strings. `null` disables nullable settings (`row_group_col`,
 `unique_by_cols`, `dedup_timestamp`, `granularity`, and repack rules); it does not
 delete their tags. Other tags remain unchanged.
 
-`timezone` and `granularity` are written as **column tags** on the effective
-`time_column`: the value supplied in the same request, or the existing table tag.
-An error is returned if that column cannot be resolved. Existing column tags on
-other columns are left untouched. Changing `time_column` does not move those tags;
-supply timezone/granularity again if they should apply to the new column.
+All settings, including `timezone` and `granularity`, are written as **table tags**
+in `ducklake_tag`, with `object_id` set to the table ID. They may be configured
+before `time_column`; changing `time_column` retains these settings and validates
+them against the new column's type.
 
 All tables and referenced columns must exist. Time columns must be dates or
 microsecond timestamps, and dedup timestamp columns must be microsecond
@@ -137,7 +136,7 @@ The same validated batch operation is available to library callers as
 `dkplus::tags::update(&postgres_config, updates)`, where `updates` is a
 `dkplus::tags::Updates` map of table names to setting names and JSON values.
 Unlike the lower-level `Table::update_tags` API, this operation validates dkplus
-settings and routes timezone/granularity to column tags.
+settings and writes all of them to `ducklake_tag`.
 
 ### Resolve policy in library code
 
@@ -163,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let table = Table::builder("weather.observations", &cfg)
         .with_time_column("observed") // Optional if DuckLake's dkplus.time_column tag is set.
-        .with_timezone(chrono_tz::America::New_York) // Optional if the column's dkplus.timezone tag is set.
+        .with_timezone(chrono_tz::America::New_York) // Optional if DuckLake's dkplus.timezone table tag is set.
         .with_row_group_col("station") // Optional if DuckLake's dkplus.row_group_col tag is set.
         .with_sort_cols(vec!["station".into(), "observed".into()]) // Optional if DuckLake's dkplus.sort_cols tag is set.
         .with_unique_by_cols(vec!["station".into(), "observed".into()]) // Optional if DuckLake's dkplus.unique_by_cols tag is set.
@@ -263,7 +262,7 @@ async fn build() -> dkplus::Result<Table> {
 
 `Table::builder("schema.table", &cfg)` and `cfg.table_builder("schema.table")`
 return the same builder, which retains a cloned config. Call `.resolve().await?`
-to resolve policy from explicit values and active DuckLake table/column tags.
+to resolve policy from explicit values and active DuckLake table tags.
 Use `cfg.table("schema.table").await?` to resolve using only DuckLake metadata,
 without any overrides. Explicit values override tags. Required
 settings left unresolved by both sources fail with an error.
@@ -274,7 +273,7 @@ DuckLake; use `Table::update_tags` to persist table-level changes.
 | Setting | Meaning |
 |---|---|
 | `time_column` | Required window column; its `date`, `timestamp`, or `timestamptz` type is inferred from the catalog. |
-| `timezone` | Target IANA zone, supplied explicitly or by the time column's `dkplus.timezone` tag (with the table tag as a legacy fallback). Required even for naive/date tables, where boundaries remain wall-clock values. It is not inferable from `timestamptz`, which stores instants, not a named zone. |
+| `timezone` | Target IANA zone, supplied explicitly or by the table's `dkplus.timezone` tag. Required even for naive/date tables, where boundaries remain wall-clock values. It is not inferable from `timestamptz`, which stores instants, not a named zone. |
 | `row_group_col` | Optional grouping column; must lead `sort_cols`. Missing/`null` means no row grouping. |
 | `sort_cols` | Required ascending sort order of repacked files. |
 | `unique_by_cols` | Optional columns defining duplicates; missing/`null` disables deduplication. |
@@ -284,22 +283,21 @@ DuckLake; use `Table::update_tags` to persist table-level changes.
 | `lock_namespace` | Optional explicit lock namespace; defaults to the table name. |
 | `author` | Optional snapshot author override; defaults to an operation/window-derived value. |
 
-The recognized settings are table-level entries in DuckLake's `ducklake_tag` table,
-except that `dkplus.timezone` should be set on the time column in
-`ducklake_column_tag` (`table_id`, `column_id`, `begin_snapshot`, `end_snapshot`,
-`key`, `value`). The column tag takes precedence over the legacy table-level
-timezone tag; an explicit `with_timezone` overrides both.
+All recognized settings are table-level entries in DuckLake's `ducklake_tag`
+table (`object_id`, `begin_snapshot`, `end_snapshot`, `key`, `value`), with
+`object_id` set to the table ID. Column tags are neither read nor written;
+an explicit `with_timezone` overrides the table's timezone tag.
 The `key` identifies the setting, and `value` is a string containing JSON:
 
 | Tag key | JSON value example | How dkplus uses it |
 |---|---|---|
 | `dkplus.time_column` | `"observed"` | Required column defining repack windows. Its catalog type determines whether boundaries are dates or timestamps. |
-| `dkplus.timezone` | `"America/New_York"` | Time-column tag defining the target IANA time zone for repack boundaries; a table-level tag remains supported as a fallback. |
+| `dkplus.timezone` | `"America/New_York"` | Target IANA time zone for repack boundaries. |
 | `dkplus.row_group_col` | `"station"` or `null` | Optional row-group key. When set, it must be the first column in `dkplus.sort_cols`. |
 | `dkplus.sort_cols` | `["station", "observed"]` | Required ascending sort order for repacked files. |
 | `dkplus.unique_by_cols` | `["station", "observed"]` or `null` | Optional duplicate key. When set, dkplus keeps the row selected using `dkplus.dedup_timestamp`. |
 | `dkplus.dedup_timestamp` | `"fetched_at"` or `null` | Optional microsecond timestamp column used to select a retained row for each duplicate key. Required when `unique_by_cols` is set. |
-| `dkplus.granularity` | `"5 minutes"`, `"unpredictable"` or `null` | Time-column tag (table-level fallback) giving the spacing of time values as a Postgres interval. Used by `find_potential_repacks`. |
+| `dkplus.granularity` | `"5 minutes"`, `"unpredictable"` or `null` | Spacing of time values as a Postgres interval. Used by `find_potential_repacks`. |
 | `dkplus.repack_level<N>_<rule>` | `"1 day"`, `"month"` or `null` | Maintenance repack level rules; see below. |
 
 For example, the tag values for a table configured to group and sort by station
@@ -307,16 +305,25 @@ could be:
 
 ```text
 dkplus.time_column      = "observed"
+dkplus.timezone         = "America/New_York"
+dkplus.granularity      = "5 minutes"
 dkplus.row_group_col    = "station"
 dkplus.sort_cols        = ["station", "observed"]
 dkplus.unique_by_cols   = ["station", "observed"]
 dkplus.dedup_timestamp  = "fetched_at"
 ```
 
-On the `observed` column, set `dkplus.timezone = "America/New_York"` (and
-optionally `dkplus.granularity = "5 minutes"`) in `ducklake_column_tag`, with the
-value encoded as a JSON string just like table tags. Only tags active at the latest snapshot are used. Duplicate active timezone
-tags for a column, malformed JSON, and invalid IANA zones fail explicitly.
+Only tags active at the latest snapshot are used. Duplicate active table tags
+for a setting, malformed JSON, and invalid IANA zones fail explicitly.
+
+Older dkplus versions wrote timezone and granularity to `ducklake_column_tag`.
+Before using an existing catalog, reapply any column-only values as table tags
+using the binary or `dkplus::tags::update` (for example,
+`dkplus "$DATABASE_URL" weather.observations granularity "5 minutes"`).
+Existing table-level timezone values already work. This does not migrate or
+remove old column-tag rows: those require separate catalog cleanup, because
+DuckLake readers can reject catalogs containing column tags. Do not rely on
+ending their snapshot visibility alone if the reader rejects any such rows.
 
 List values are JSON arrays; nullable optional values can be JSON `null` (for
 example, `dkplus.row_group_col = null` disables row grouping). Missing optional
