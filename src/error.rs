@@ -18,6 +18,8 @@ pub enum Error {
     TableNotFound { table: String },
     #[error("invalid input: {reason}")]
     InvalidInput { reason: String },
+    #[error("lock unavailable: {reason}")]
+    LockUnavailable { reason: String },
     #[error("invalid data: {reason}")]
     InvalidData { reason: String },
     #[error("invalid storage path: {reason}")]
@@ -144,6 +146,9 @@ macro_rules! source_errors {
                         source,
                     },)*
                     Self::InvalidInput { reason } => Self::InvalidInput {
+                        reason: format!("{context}: {reason}"),
+                    },
+                    Self::LockUnavailable { reason } => Self::LockUnavailable {
                         reason: format!("{context}: {reason}"),
                     },
                     Self::InvalidData { reason } => Self::InvalidData {

@@ -1722,6 +1722,52 @@ async fn lock_range(client: &Client, job: &Job, window: Window) -> Result<()> {
     Ok(())
 }
 
+async fn try_lock_range(client: &Client, job: &Job, window: Window) -> Result<bool> {
+    let (schema, table) = job.names();
+    let statement = client
+        .prepare("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
+        .await
+        .context("preparing repack advisory locks")?;
+    let last_instant = window
+        .end
+        .checked_sub_signed(chrono::Duration::microseconds(1))
+        .context("lock range underflow")?;
+    let last = last_instant.date_naive();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let mut date = window.start.date_naive();
+        let mut acquired_all = true;
+        while date <= last {
+            let key = format!("{}:{schema}.{table}:{date}", job.table.lock_namespace);
+            let acquired: bool = client
+                .query_one(&statement, &[&key])
+                .await
+                .with_context(|| {
+                    format!("acquiring repack advisory lock for {schema}.{table} {date}")
+                })?
+                .try_get(0)?;
+            if !acquired {
+                acquired_all = false;
+                break;
+            }
+            date = date
+                .succ_opt()
+                .context("repack lock date is out of range")?;
+        }
+        if acquired_all {
+            return Ok(true);
+        }
+        client
+            .query_one("SELECT pg_advisory_unlock_all()", &[])
+            .await
+            .context("releasing partial repack advisory locks")?;
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 async fn has_current_files(c: &impl GenericClient, table_id: i64, job: &Job) -> Result<bool> {
     let Some(files) = &job.files else {
         return Ok(true);
@@ -2304,6 +2350,23 @@ async fn run(job: &Job) -> Result<()> {
         ),
     );
     let mut client = connect(cfg).await?;
+    let (schema_name, table_name) = job.names();
+    let meta = table_meta(&client, schema_name, table_name).await?;
+    let preflight = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await?;
+    if !has_current_files(&preflight, meta.table_id, job).await? {
+        preflight.commit().await?;
+        progress(
+            log,
+            "none of the supplied files are current; skipping already completed repack".into(),
+        );
+        return Ok(());
+    }
+    preflight.commit().await?;
     progress(
         log,
         format!(
@@ -2314,7 +2377,15 @@ async fn run(job: &Job) -> Result<()> {
             job.table.timezone
         ),
     );
-    lock_range(&client, job, window).await?;
+    if !try_lock_range(&client, job, window).await? {
+        fail!(
+            LockUnavailable,
+            "repack advisory locks for {} [{}, {}) remained busy for one second",
+            job.table,
+            job.begin.label(&job.table),
+            job.end.label(&job.table)
+        );
+    }
     progress(
         log,
         format!(
@@ -2325,8 +2396,6 @@ async fn run(job: &Job) -> Result<()> {
             job.table.timezone
         ),
     );
-    let (schema_name, table_name) = job.names();
-    let meta = table_meta(&client, schema_name, table_name).await?;
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
@@ -3784,10 +3853,19 @@ mod tests {
         .unwrap();
         alias.table.timezone = chrono_tz::UTC;
         set_dates(&mut alias, "2026-01-15", "2026-02-15");
+        let alias_window = Window::for_job(&alias).unwrap();
+        assert!(!try_lock_range(&waiter, &alias, alias_window).await.unwrap());
+        let waiter_locks: i64 = other
+            .query_one(
+                "SELECT count(*) FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND granted",
+                &[&waiter_pid],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(waiter_locks, 0);
         let mut waiting = tokio::spawn(async move {
-            lock_range(&waiter, &alias, Window::for_job(&alias).unwrap())
-                .await
-                .unwrap();
+            lock_range(&waiter, &alias, alias_window).await.unwrap();
             waiter
         });
         timeout(Duration::from_secs(5), async {
