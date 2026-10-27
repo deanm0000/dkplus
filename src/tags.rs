@@ -15,12 +15,12 @@ fn normalize(settings: &BTreeMap<String, Value>) -> Result<HashMap<String, Strin
         match key.as_str() {
             TAG_TIME_COLUMN | TAG_TIMEZONE => {
                 if !value.is_string() {
-                    bail!("{name} must be a string");
+                    fail!(InvalidInput, "{name} must be a string");
                 }
             }
             TAG_ROW_GROUP_COL | TAG_DEDUP_TIMESTAMP | TAG_GRANULARITY => {
                 if !value.is_string() && !value.is_null() {
-                    bail!("{name} must be a string or null");
+                    fail!(InvalidInput, "{name} must be a string or null");
                 }
             }
             TAG_SORT_COLS | TAG_UNIQUE_BY_COLS => {
@@ -29,25 +29,28 @@ fn normalize(settings: &BTreeMap<String, Value>) -> Result<HashMap<String, Strin
                         .with_context(|| format!("{name} must be an array of column names"))?;
                     if names.is_empty() || names.iter().collect::<HashSet<_>>().len() != names.len()
                     {
-                        bail!("{name} must contain nonempty, distinct column names");
+                        fail!(
+                            InvalidInput,
+                            "{name} must contain nonempty, distinct column names"
+                        );
                     }
                 }
             }
             _ if key.starts_with(TAG_LEVEL_PREFIX) => {
                 if !value.is_string() && !value.is_null() {
-                    bail!("{name} must be a string or null");
+                    fail!(InvalidInput, "{name} must be a string or null");
                 }
                 let single = HashMap::from([(key.clone(), value.to_string())]);
                 for (_, rule, _) in level_tags(&single)?.into_values().flatten() {
                     if rule != "calendar_begin" && !LEVEL_INTERVAL_RULES.contains(&rule) {
-                        bail!("unknown repack level rule {name:?}");
+                        fail!(InvalidInput, "unknown repack level rule {name:?}");
                     }
                 }
             }
-            _ => bail!("unknown dkplus setting {name:?}"),
+            _ => fail!(InvalidInput, "unknown dkplus setting {name:?}"),
         }
         if tags.insert(key.clone(), value.to_string()).is_some() {
-            bail!("duplicate setting {key:?}");
+            fail!(InvalidInput, "duplicate setting {key:?}");
         }
     }
     Ok(tags)
@@ -80,7 +83,10 @@ async fn validate(
             DataType::Date32 => TimeType::Date,
             DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => TimeType::TimestampTz,
             DataType::Timestamp(TimeUnit::Microsecond, None) => TimeType::Timestamp,
-            _ => bail!("time_column must be a date or microsecond timestamp"),
+            _ => fail!(
+                InvalidInput,
+                "time_column must be a date or microsecond timestamp"
+            ),
         };
     }
     if let Some(name) = time {
@@ -107,14 +113,14 @@ async fn validate(
     for key in [TAG_SORT_COLS, TAG_UNIQUE_BY_COLS] {
         if let Some(list) = tag_value::<Option<Vec<String>>>(tags, key)?.flatten() {
             if list.iter().collect::<HashSet<_>>().len() != list.len() {
-                bail!("{key} must contain distinct column names");
+                fail!(InvalidInput, "{key} must contain distinct column names");
             }
             names.extend(list);
         }
     }
     for name in names {
         if !meta.columns.contains_key(&name) {
-            bail!("configured column {name:?} is not in table");
+            fail!(InvalidInput, "configured column {name:?} is not in table");
         }
     }
     if let Some(name) = &policy.dedup_timestamp
@@ -123,7 +129,10 @@ async fn validate(
             DataType::Timestamp(TimeUnit::Microsecond, _)
         )
     {
-        bail!("dedup timestamp column {name:?} must be a microsecond timestamp");
+        fail!(
+            InvalidInput,
+            "dedup timestamp column {name:?} must be a microsecond timestamp"
+        );
     }
     let effective = |key| {
         time_col
@@ -186,7 +195,10 @@ struct Change {
 /// This operation needs no object-store credentials.
 pub async fn update(postgres: &tokio_postgres::Config, updates: Updates) -> Result<i64> {
     if updates.is_empty() || updates.values().any(BTreeMap::is_empty) {
-        bail!("provide at least one table and at least one setting per table");
+        fail!(
+            InvalidInput,
+            "provide at least one table and at least one setting per table"
+        );
     }
     let mut normalized = Vec::new();
     for (name, settings) in updates {
@@ -194,7 +206,7 @@ pub async fn update(postgres: &tokio_postgres::Config, updates: Updates) -> Resu
             .split_once('.')
             .context("table name must be schema.table")?;
         if table.contains('.') {
-            bail!("table name must be schema.table");
+            fail!(InvalidInput, "table name must be schema.table");
         }
         identifier(schema)?;
         identifier(table)?;
@@ -202,7 +214,9 @@ pub async fn update(postgres: &tokio_postgres::Config, updates: Updates) -> Resu
             name.clone(),
             schema.to_owned(),
             table.to_owned(),
-            normalize(&settings).with_context(|| format!("validating settings for {name}"))?,
+            normalize(&settings)
+                .with_context(|| format!("validating settings for {name}"))
+                .map_err(|error| error.for_table(&name))?,
         ));
     }
     let mut client = connect_catalog(postgres, Arc::new(|message| eprintln!("{message}"))).await?;
@@ -231,7 +245,9 @@ pub async fn update(postgres: &tokio_postgres::Config, updates: Updates) -> Resu
             )
             .await
             .context("looking up DuckLake table")?
-            .with_context(|| format!("DuckLake table {name} not found"))?;
+            .ok_or_else(|| Error::TableNotFound {
+                table: name.clone(),
+            })?;
         let table_id: i64 = row.get(0);
         let mut meta = TableMeta {
             table_id,
@@ -262,13 +278,17 @@ pub async fn update(postgres: &tokio_postgres::Config, updates: Updates) -> Resu
         let time: Option<String> = tag_value(&effective, TAG_TIME_COLUMN)?;
         for (key, value) in requested {
             let column_id = if key == TAG_TIMEZONE || key == TAG_GRANULARITY {
-                let time = time
-                    .as_ref()
-                    .with_context(|| format!("{name}: {key} requires time_column"))?;
+                let time = time.as_ref().ok_or_else(|| Error::MissingRequiredSetting {
+                    table: name.clone(),
+                    setting: "time_column",
+                })?;
                 Some(
                     meta.columns
                         .get(time)
-                        .with_context(|| format!("{name}: column {time:?} does not exist"))?
+                        .ok_or_else(|| Error::InvalidConfiguration {
+                            table: name.clone(),
+                            reason: format!("column {time:?} does not exist"),
+                        })?
                         .id,
                 )
             } else {
@@ -291,7 +311,8 @@ pub async fn update(postgres: &tokio_postgres::Config, updates: Updates) -> Resu
         }
         validate(&tx, &schema, &table, &meta, &active, &columns)
             .await
-            .with_context(|| format!("validating policy for {name}"))?;
+            .with_context(|| format!("validating policy for {name}"))
+            .map_err(|error| error.for_table(&name))?;
     }
     if changes.is_empty() {
         tx.commit()
@@ -359,7 +380,7 @@ pub async fn update(postgres: &tokio_postgres::Config, updates: Updates) -> Resu
             }
             .with_context(|| format!("ending active tag {key:?}"))?;
             if ended != 1 {
-                bail!("active tag {key:?} changed during update");
+                fail!(CatalogChanged, "active tag {key:?} changed during update");
             }
         }
         match column_id {

@@ -1,5 +1,6 @@
 //! Repack-level rules and the wall-clock arithmetic used to evaluate them.
-use anyhow::{Result, bail};
+use crate::Result;
+use crate::error::fail;
 use chrono::{
     DateTime, Datelike, Duration, Months, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc,
 };
@@ -91,7 +92,7 @@ pub enum CalendarUnit {
 }
 
 impl std::str::FromStr for CalendarUnit {
-    type Err = anyhow::Error;
+    type Err = crate::Error;
 
     fn from_str(value: &str) -> Result<Self> {
         Ok(match value {
@@ -102,7 +103,8 @@ impl std::str::FromStr for CalendarUnit {
             "month" => Self::Month,
             "quarter" => Self::Quarter,
             "year" => Self::Year,
-            _ => bail!(
+            _ => fail!(
+                InvalidInput,
                 "calendar unit {value:?} must be one of minute, hour, day, week, month, quarter, year"
             ),
         })

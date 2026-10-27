@@ -1,7 +1,9 @@
-use anyhow::{Context, Result, bail};
 use dkplus::tags::Updates;
+use dkplus::{Error, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::error::Error as _;
+use std::process::ExitCode;
 
 const USAGE: &str = "\
 Usage:
@@ -20,30 +22,40 @@ enum Input {
 
 fn parse(args: &[String]) -> Result<(&str, Input)> {
     if args.len() < 3 {
-        bail!("{USAGE}");
+        return Err(Error::InvalidInput {
+            reason: USAGE.into(),
+        });
     }
     if args[1] == "--file" {
         if args.len() != 3 {
-            bail!("--file requires exactly one file name\n\n{USAGE}");
+            return Err(Error::InvalidInput {
+                reason: format!("--file requires exactly one file name\n\n{USAGE}"),
+            });
         }
         return Ok((&args[0], Input::File(args[2].clone())));
     }
     if args.len() < 4 || args.len() % 2 != 0 {
-        bail!("provide a table and complete key/value pairs\n\n{USAGE}");
+        return Err(Error::InvalidInput {
+            reason: format!("provide a table and complete key/value pairs\n\n{USAGE}"),
+        });
     }
     let mut settings = BTreeMap::new();
     for pair in args[2..].chunks_exact(2) {
         let name = pair[0].strip_prefix("dkplus.").unwrap_or(&pair[0]);
         let value = if ["sort_cols", "unique_by_cols"].contains(&name) {
-            serde_json::from_str(&pair[1])
-                .with_context(|| format!("{name} requires a JSON array or null"))?
+            serde_json::from_str(&pair[1]).map_err(|source| Error::Json {
+                operation: format!("{name} requires a JSON array or null"),
+                source,
+            })?
         } else if pair[1] == "null" && name != "time_column" && name != "timezone" {
             Value::Null
         } else {
             Value::String(pair[1].clone())
         };
         if settings.insert(pair[0].clone(), value).is_some() {
-            bail!("duplicate setting {:?}", pair[0]);
+            return Err(Error::InvalidInput {
+                reason: format!("duplicate setting {:?}", pair[0]),
+            });
         }
     }
     Ok((
@@ -53,7 +65,23 @@ fn parse(args: &[String]) -> Result<(&str, Input)> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            // Display already includes the immediate source; print any deeper causes.
+            let mut cause = error.source().and_then(|source| source.source());
+            while let Some(source) = cause {
+                eprintln!("Caused by: {source}");
+                cause = source.source();
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args
         .first()
@@ -66,14 +94,20 @@ async fn main() -> Result<()> {
     let updates = match input {
         Input::Inline(updates) => updates,
         Input::File(path) => {
-            let file = std::fs::File::open(&path).with_context(|| format!("opening {path:?}"))?;
-            serde_json::from_reader(file)
-                .with_context(|| format!("reading policy JSON from {path:?}"))?
+            let file = std::fs::File::open(&path).map_err(|source| Error::Io {
+                operation: format!("opening {path:?}"),
+                source,
+            })?;
+            serde_json::from_reader(file).map_err(|source| Error::Json {
+                operation: format!("reading policy JSON from {path:?}"),
+                source,
+            })?
         }
     };
-    let postgres = connection
-        .parse()
-        .context("invalid Postgres connection string")?;
+    let postgres = connection.parse().map_err(|source| Error::Catalog {
+        operation: "invalid Postgres connection string".into(),
+        source,
+    })?;
     let snapshot = dkplus::tags::update(&postgres, updates).await?;
     println!("Policy applied; catalog snapshot {snapshot}");
     Ok(())

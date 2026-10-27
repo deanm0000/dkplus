@@ -327,12 +327,15 @@ impl Runs {
         cols: &[&Column],
     ) -> Result<Option<FileInfo>> {
         if self.report.sort_cols.is_empty() {
-            bail!("report sort columns must not be empty");
+            fail!(InvalidInput, "report sort columns must not be empty");
         }
         if let Some(column) = self.report.row_group_col.as_deref()
             && self.report.sort_cols.first().map(String::as_str) != Some(column)
         {
-            bail!("row-group column {column} must be the first sort column");
+            fail!(
+                InvalidInput,
+                "row-group column {column} must be the first sort column"
+            );
         }
         self.flush(work).await?;
         if self.paths.is_empty() {

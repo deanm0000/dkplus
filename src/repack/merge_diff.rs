@@ -18,19 +18,26 @@ pub(crate) async fn run(
     let unique = table
         .unique_by_cols
         .as_ref()
-        .context("merge_diff requires unique_by_cols")?;
-    let timestamp = table
-        .dedup_timestamp
-        .as_deref()
-        .context("merge_diff requires dedup_timestamp")?;
+        .ok_or_else(|| Error::MissingRequiredSetting {
+            table: table.to_string(),
+            setting: "unique_by_cols",
+        })?;
+    let timestamp =
+        table
+            .dedup_timestamp
+            .as_deref()
+            .ok_or_else(|| Error::MissingRequiredSetting {
+                table: table.to_string(),
+                setting: "dedup_timestamp",
+            })?;
     if unique.iter().any(|name| name == timestamp) {
-        bail!("dedup_timestamp must not be a unique key");
+        fail!(InvalidInput, "dedup_timestamp must not be a unique key");
     }
     let batches: Vec<_> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
     let (start, end) = table.replacement_bounds(&batches)?;
     for batch in &batches {
         if batch.schema() != batches[0].schema() {
-            bail!("load batch schemas differ");
+            fail!(InvalidInput, "load batch schemas differ");
         }
     }
     let (diff_schema, diff_name) = diff_name
@@ -43,7 +50,7 @@ pub(crate) async fn run(
     };
     diff_table.validate()?;
     if diff_table.schema == table.schema && diff_table.table == table.table {
-        bail!("diff table must differ from the target table");
+        fail!(InvalidInput, "diff table must differ from the target table");
     }
     let window = Window { start, end };
     let last = end
@@ -63,7 +70,7 @@ pub(crate) async fn run(
         .with_expire_snapshot(ExpireSnapshot::Never);
     job.validate()?;
     if table.cfg.repack_run_bytes == 0 || table.cfg.repack_node_bytes == 0 {
-        bail!("repack memory budgets must be positive");
+        fail!(InvalidInput, "repack memory budgets must be positive");
     }
     let mut client = connect(&table.cfg).await?;
     lock_range(&client, &job, Window::for_job(&job)?).await?;
@@ -84,7 +91,7 @@ pub(crate) async fn run(
         .get(&table.time_column)
         .context("missing time column")?;
     if types::arrow_type(&utc_col.ty)? != types::arrow_type(table.time_type.sql())? {
-        bail!("window column type does not match table");
+        fail!(InvalidInput, "window column type does not match table");
     }
     let inlined = read_inlined(&tx, &meta, table, window).await?;
     let selected = sources(&tx, meta.table_id, utc_col.id, table, window).await?;
@@ -162,6 +169,12 @@ pub(crate) async fn run(
                     tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
                     attempt += 1;
                 }
+                Err(error) if is_commit_conflict(&error) => {
+                    return Err(Error::CommitRetriesExhausted {
+                        attempts: attempt,
+                        source: Box::new(error),
+                    });
+                }
                 Err(error) => return Err(error),
             }
         };
@@ -236,7 +249,8 @@ async fn read_window(
             }
         }
         if offset != source.rows || deleted.peek().await?.is_some() {
-            bail!(
+            fail!(
+                InvalidInput,
                 "record count or delete positions mismatch for source {}",
                 source.id
             );
@@ -325,7 +339,10 @@ async fn compare(
                     .collect::<Result<Vec<_>>>()?;
                 let batch = RecordBatch::try_new(schema.clone(), columns)?;
                 if batch.column(schema.index_of(timestamp)?).null_count() > 0 {
-                    bail!("merge_diff dedup timestamp must not contain nulls");
+                    fail!(
+                        InvalidInput,
+                        "merge_diff dedup timestamp must not contain nulls"
+                    );
                 }
                 Ok(batch)
             })
@@ -682,14 +699,16 @@ mod tests {
     async fn invalid_input_fails_before_connecting() {
         let mut table = crate::test_support::table();
         let input = batch(&[("apple", Some(27), Some(23))]);
-        assert!(
+        assert!(matches!(
             table
                 .merge_diff(vec![input.clone()], "history")
                 .await
-                .unwrap_err()
-                .to_string()
-                .contains("requires unique_by_cols")
-        );
+                .unwrap_err(),
+            Error::MissingRequiredSetting {
+                setting: "unique_by_cols",
+                ..
+            }
+        ));
         table.unique_by_cols = Some(vec!["node".into()]);
         table.dedup_timestamp = Some("node".into());
         assert!(

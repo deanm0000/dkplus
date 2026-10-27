@@ -1,5 +1,6 @@
+use crate::error::{Context, fail};
 use crate::{Config, Storage, catalog_table_root, config::identifier, connect, join_dir};
-use anyhow::{Context, Result, bail};
+use crate::{Error, Result};
 use chrono::{DateTime, Utc};
 use object_store::ObjectStoreExt;
 use std::collections::{HashMap, HashSet};
@@ -44,7 +45,10 @@ pub struct CleanupReport {
 // Store keys alone are insufficient for Azure: containers are separate namespaces.
 fn identity(storage: &Storage, path: &str) -> Result<String> {
     if path.split('/').any(|part| part == "." || part == "..") {
-        bail!("cleanup path contains a relative traversal component: {path}");
+        fail!(
+            InvalidStoragePath,
+            "cleanup path contains a relative traversal component: {path}"
+        );
     }
     let (_, key) = storage.resolve(path)?;
     let key = object_store::path::Path::parse(key)?.to_string();
@@ -140,18 +144,26 @@ pub async fn cleanup_expired_files(
     }
     let directory = match &options.scope {
         CleanupScope::Catalog => None,
-        CleanupScope::Table { .. } => {
-            let id = target.context("cleanup table not found")?;
+        CleanupScope::Table { schema, table } => {
+            let id = target.ok_or_else(|| Error::TableNotFound {
+                table: format!("{schema}.{table}"),
+            })?;
             let directory = identity(&cfg.storage, &roots[&id])?;
             // An empty key is the entire store, not an exclusive table directory.
             if directory.is_empty() {
-                bail!("table cleanup requires an exclusive, non-root data directory");
+                fail!(
+                    InvalidStoragePath,
+                    "table cleanup requires an exclusive, non-root data directory"
+                );
             }
             for (other_id, root) in &roots {
                 if *other_id != id {
                     let other = identity(&cfg.storage, root)?;
                     if in_directory(&other, &directory) || in_directory(&directory, &other) {
-                        bail!("table cleanup is ambiguous: overlapping table data directories");
+                        fail!(
+                            InvalidStoragePath,
+                            "table cleanup is ambiguous: overlapping table data directories"
+                        );
                     }
                 }
             }
@@ -221,7 +233,8 @@ pub async fn cleanup_expired_files(
         }
         for file in &report.files {
             if referenced.contains(&identity(&cfg.storage, &file.path)?) {
-                bail!(
+                fail!(
+                    InvalidData,
                     "queued file is still referenced by catalog metadata: {}",
                     file.path
                 );

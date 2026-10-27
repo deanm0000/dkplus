@@ -154,10 +154,18 @@ impl Bound {
             (Self::Tz(_), TimeType::TimestampTz) => Ok(()),
             (Self::Naive(_), TimeType::Timestamp) => Ok(()),
             (Self::Naive(time), TimeType::Date) if time.time() == chrono::NaiveTime::MIN => Ok(()),
-            (Self::Naive(_), TimeType::Date) => bail!("{name} must be midnight for a date column"),
-            (Self::Tz(_), _) => bail!("{name} must be a naive bound for a timestamp/date column"),
+            (Self::Naive(_), TimeType::Date) => {
+                fail!(InvalidInput, "{name} must be midnight for a date column")
+            }
+            (Self::Tz(_), _) => fail!(
+                InvalidInput,
+                "{name} must be a naive bound for a timestamp/date column"
+            ),
             (Self::Naive(_), TimeType::TimestampTz) => {
-                bail!("{name} must be a tz bound for a timestamptz column")
+                fail!(
+                    InvalidInput,
+                    "{name} must be a tz bound for a timestamptz column"
+                )
             }
         }
     }
@@ -280,26 +288,32 @@ impl Job {
         if [&self.table.schema, &self.table.table].iter().any(|part| {
             part.is_empty() || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         }) {
-            bail!("table components must use letters, digits and underscores");
+            fail!(
+                InvalidInput,
+                "table components must use letters, digits and underscores"
+            );
         }
         if let Some(unique) = &self.unique {
             if unique.is_empty() {
-                bail!("unique must contain at least one column");
+                fail!(InvalidInput, "unique must contain at least one column");
             }
             let mut seen = HashSet::new();
             for name in unique {
                 if name.is_empty() || !seen.insert(name) {
-                    bail!("unique columns must be nonempty and distinct");
+                    fail!(InvalidInput, "unique columns must be nonempty and distinct");
                 }
             }
         }
         if self.effective_unique().is_some() && self.table.dedup_timestamp.is_none() {
-            bail!("deduplication requires a dedup timestamp column");
+            fail!(
+                InvalidInput,
+                "deduplication requires a dedup timestamp column"
+            );
         }
         self.begin.validate(&self.table, "begin")?;
         self.end.validate(&self.table, "end")?;
         if self.begin.utc() >= self.end.utc() {
-            bail!("begin must precede end (exclusive)");
+            fail!(InvalidInput, "begin must precede end (exclusive)");
         }
         self.begin
             .local(&self.table)
@@ -326,7 +340,8 @@ impl Job {
                     .data_type(),
                 DataType::Timestamp(TimeUnit::Microsecond, _)
             ) {
-                bail!(
+                fail!(
+                    InvalidInput,
                     "deduplication requires a microsecond timestamp column {:?}",
                     self.table.dedup_timestamp
                 );
@@ -477,7 +492,8 @@ async fn sources(
             || r.get::<_, Option<String>>(8).is_some()
             || r.get::<_, Option<i64>>(9).is_some()
         {
-            bail!(
+            fail!(
+                UnsupportedFeature,
                 "source file {id}: mapped, encrypted, partial or non-Parquet files are not supported"
             );
         }
@@ -486,7 +502,8 @@ async fn sources(
                 || r.get::<_, Option<String>>(15).is_some()
                 || r.get::<_, Option<i64>>(16).is_some()
             {
-                bail!(
+                fail!(
+                    UnsupportedFeature,
                     "delete file {delete_id}: only unencrypted, non-partial Parquet positional deletes are supported"
                 );
             }
@@ -500,7 +517,7 @@ async fn sources(
             None
         };
         if out.last().is_some_and(|s: &Source| s.id == id) {
-            bail!("multiple active delete files for source {id}");
+            fail!(InvalidData, "multiple active delete files for source {id}");
         }
         out.push(Source {
             id,
@@ -565,7 +582,8 @@ fn normalize(
         let array: ArrayRef = if let Some(idx) = found {
             let array = batch.column(idx);
             if array.data_type() != field.data_type() {
-                bail!(
+                fail!(
+                    InvalidData,
                     "source {} field {} has incompatible type {}",
                     source.id,
                     field.name(),
@@ -588,7 +606,8 @@ fn normalize(
                 batch.num_rows(),
             ))
         } else {
-            bail!(
+            fail!(
+                InvalidData,
                 "source {} is missing field ID {id} ({})",
                 source.id,
                 field.name()
@@ -599,7 +618,8 @@ fn normalize(
     let batch = RecordBatch::try_new(target.clone(), columns)?;
     for name in [ROW_ID, SNAPSHOT_ID] {
         if batch.column(target.index_of(name)?).null_count() > 0 {
-            bail!(
+            fail!(
+                InvalidData,
                 "source {} contains null {name}; cannot safely repack",
                 source.id
             );
@@ -611,7 +631,10 @@ fn normalize(
 fn split_in_window(batch: &RecordBatch, table: &Table, window: Window) -> Result<[RecordBatch; 3]> {
     let column = batch.column(batch.schema().index_of(&table.time_column)?);
     if column.null_count() != 0 {
-        bail!("window column contains nulls; cannot safely repack");
+        fail!(
+            InvalidData,
+            "window column contains nulls; cannot safely repack"
+        );
     }
     let (times, start, end) = match table.time_type {
         TimeType::TimestampTz | TimeType::Timestamp => (
@@ -660,9 +683,9 @@ fn split_in_window(batch: &RecordBatch, table: &Table, window: Window) -> Result
             &BooleanArray::from(regions.iter().map(|r| *r == region).collect::<Vec<_>>()),
         )?);
     }
-    batches
-        .try_into()
-        .map_err(|_| anyhow!("expected three date regions"))
+    batches.try_into().map_err(|_| Error::InvalidData {
+        reason: "expected three date regions".into(),
+    })
 }
 
 #[cfg(test)]
@@ -717,7 +740,7 @@ impl Deletes {
             };
             let Some(batch) = stream.try_next().await? else {
                 if self.count != self.expected {
-                    bail!("delete count mismatch");
+                    fail!(InvalidData, "delete count mismatch");
                 }
                 self.stream = None;
                 return Ok(None);
@@ -734,7 +757,8 @@ impl Deletes {
             {
                 let pos = pos.context("null delete position")?;
                 if pos < 0 || pos >= self.source_rows || self.previous.is_some_and(|p| pos <= p) {
-                    bail!(
+                    fail!(
+                        InvalidData,
                         "delete positions must be unique, ascending and within source row bounds"
                     );
                 }
@@ -753,7 +777,7 @@ impl Deletes {
                 break;
             }
             if pos < offset {
-                bail!("delete cursor fell behind source rows");
+                fail!(InvalidData, "delete cursor fell behind source rows");
             }
             keep[(pos - offset) as usize] = false;
             self.index += 1;
@@ -827,10 +851,18 @@ impl FastCursor {
         loop {
             let Some(next_bounds) = self.groups.next_bounds() else {
                 if self.row_offset != self.source.rows {
-                    bail!("record count mismatch for source {}", self.source.id);
+                    fail!(
+                        InvalidData,
+                        "record count mismatch for source {}",
+                        self.source.id
+                    );
                 }
                 if self.deletes.peek().await?.is_some() {
-                    bail!("unconsumed delete positions for source {}", self.source.id);
+                    fail!(
+                        InvalidData,
+                        "unconsumed delete positions for source {}",
+                        self.source.id
+                    );
                 }
                 self.finished = true;
                 return Ok(FastLoad::Finished);
@@ -840,7 +872,11 @@ impl FastCursor {
                 return Ok(if optional { FastLoad::Deferred } else { reason });
             }
             let Some((bounds, raw)) = self.groups.next_group().await? else {
-                bail!("source {} row-group metadata changed", self.source.id);
+                fail!(
+                    InvalidData,
+                    "source {} row-group metadata changed",
+                    self.source.id
+                );
             };
             if let Some(reason) = row_group_values_mismatch(&raw, row_group_col, &bounds)? {
                 return Ok(FastLoad::Ineligible(format!(
@@ -855,7 +891,11 @@ impl FastCursor {
                 .checked_add(count)
                 .context("source row offset overflow")?;
             if next_offset > self.source.rows {
-                bail!("record count mismatch for source {}", self.source.id);
+                fail!(
+                    InvalidData,
+                    "record count mismatch for source {}",
+                    self.source.id
+                );
             }
             let normalized = normalize(&raw, target, &self.source, self.row_offset)?;
             let keep = self.deletes.mask(self.row_offset, raw.num_rows()).await?;
@@ -919,7 +959,7 @@ async fn fill_cursors(
                     .with_context(|| {
                         format!("reading row group for source {}", cursor.source.id)
                     })?;
-                Ok::<_, anyhow::Error>(fast_load_reason(cursor.source.id, result))
+                Ok::<_, crate::Error>(fast_load_reason(cursor.source.id, result))
             });
         }
     }
@@ -1069,7 +1109,7 @@ async fn try_aligned(
             let groups = match groups {
                 sort::RowGroupOpen::Eligible(groups) => groups,
                 sort::RowGroupOpen::Ineligible(reason) => {
-                    return Ok::<_, anyhow::Error>(Err(format!(
+                    return Ok::<_, crate::Error>(Err(format!(
                         "source {} is not eligible: {reason}",
                         source.id
                     )));
@@ -1399,7 +1439,7 @@ async fn align_cursors_with_window(
                     .write(batch)
                     .await?;
             }
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, crate::Error>(())
         };
         if let Some(reason) = fast_wait(
             log,
@@ -1475,7 +1515,7 @@ async fn align_cursors_with_window(
         files.push(fast_wait(log, job, "finalizing output file", writer.finish()).await?);
     }
     if files.iter().map(|file| file.rows).sum::<i64>() != output_rows - removed {
-        bail!("aligned repack row count mismatch");
+        fail!(InvalidData, "aligned repack row count mismatch");
     }
     fast_progress(
         log,
@@ -1590,10 +1630,18 @@ async fn prepare(context: PrepareContext<'_>) -> Result<Vec<FileInfo>> {
             }
         }
         if offset != source.rows {
-            bail!("record count mismatch for source {}", source.id);
+            fail!(
+                InvalidData,
+                "record count mismatch for source {}",
+                source.id
+            );
         }
         if deleted.peek().await?.is_some() {
-            bail!("unconsumed delete positions for source {}", source.id);
+            fail!(
+                InvalidData,
+                "unconsumed delete positions for source {}",
+                source.id
+            );
         }
         progress(
             log,
@@ -1639,7 +1687,7 @@ async fn prepare(context: PrepareContext<'_>) -> Result<Vec<FileInfo>> {
         }
     }
     if files.iter().map(|f| f.rows).sum::<i64>() != live_rows - discarded_rows - removed {
-        bail!("repack row count mismatch");
+        fail!(InvalidData, "repack row count mismatch");
     }
     Ok(files)
 }
@@ -1746,7 +1794,10 @@ async fn check_inlined(
     window: Window,
 ) -> Result<()> {
     if has_inlined_rows(c, table_id, table, window.start, window.end).await? {
-        bail!("range contains inlined data; flush it to Parquet before repacking");
+        fail!(
+            InvalidInput,
+            "range contains inlined data; flush it to Parquet before repacking"
+        );
     }
     Ok(())
 }
@@ -1846,7 +1897,10 @@ async fn commit(
         (snap.get(0), snap.get(1), snap.get(2), snap.get(3));
     let current = sources(&tx, meta.table_id, utc_col, &job.table, window).await?;
     if current != selected {
-        bail!("repack sources changed while sorting; retry the job");
+        fail!(
+            CatalogChanged,
+            "repack sources changed while sorting; retry the job"
+        );
     }
     if replacement.is_none() {
         check_inlined(&tx, meta.table_id, &job.table, window).await?;
@@ -1854,14 +1908,23 @@ async fn commit(
     // A schema change can leave the same files active. Reject rather than publish stale field IDs.
     let (schema_name, table_name) = job.names();
     if table_meta(&tx, schema_name, table_name).await? != *meta {
-        bail!("table metadata changed while sorting; retry the job");
+        fail!(
+            CatalogChanged,
+            "table metadata changed while sorting; retry the job"
+        );
     }
     if let Some(diff) = &diff {
         if table_meta(&tx, &diff.table.schema, &diff.table.table).await? != *diff.meta {
-            bail!("diff table metadata changed while merging; retry the job");
+            fail!(
+                CatalogChanged,
+                "diff table metadata changed while merging; retry the job"
+            );
         }
         if merge_diff::read_inlined(&tx, meta, &job.table, window).await? != diff.inlined {
-            bail!("inlined rows changed while merging; retry the job");
+            fail!(
+                CatalogChanged,
+                "inlined rows changed while merging; retry the job"
+            );
         }
     }
     let removed = selected
@@ -1870,7 +1933,10 @@ async fn commit(
         .sum::<i64>()
         - files.iter().map(|f| f.rows).sum::<i64>();
     if removed < 0 || (replacement.is_none() && job.effective_unique().is_none() && removed != 0) {
-        bail!("invalid repack logical row count change: {removed}");
+        fail!(
+            InvalidData,
+            "invalid repack logical row count change: {removed}"
+        );
     }
     let snapshot_id = prev + 1;
     tx.execute(
@@ -1951,7 +2017,7 @@ async fn commit(
         )
         .await?;
     if n != ids.len() as u64 {
-        bail!("source files changed while committing");
+        fail!(CatalogChanged, "source files changed while committing");
     }
     tx.execute(
         "UPDATE ducklake.ducklake_delete_file SET end_snapshot = $1
@@ -2023,7 +2089,10 @@ async fn commit(
             )
             .await?;
         if updated != 1 {
-            bail!("table statistics missing while committing compaction");
+            fail!(
+                InvalidData,
+                "table statistics missing while committing compaction"
+            );
         }
     }
     if expire {
@@ -2112,7 +2181,7 @@ pub(crate) async fn replace_window(
     incoming: &crate::FileInfo,
 ) -> Result<crate::LoadReport> {
     if table.cfg.repack_run_bytes == 0 || table.cfg.repack_node_bytes == 0 {
-        bail!("repack memory budgets must be positive");
+        fail!(InvalidInput, "repack memory budgets must be positive");
     }
     let last = window
         .end
@@ -2190,6 +2259,12 @@ pub(crate) async fn replace_window(
                         .await;
                     attempt += 1;
                 }
+                Err(error) if is_commit_conflict(&error) => {
+                    return Err(Error::CommitRetriesExhausted {
+                        attempts: attempt,
+                        source: Box::new(error),
+                    });
+                }
                 Err(error) => return Err(error),
             }
         };
@@ -2216,7 +2291,7 @@ async fn run(job: &Job) -> Result<()> {
     job.validate()?;
     let window = Window::for_job(job)?;
     if cfg.repack_run_bytes == 0 || cfg.repack_node_bytes == 0 {
-        bail!("repack memory budgets must be positive");
+        fail!(InvalidInput, "repack memory budgets must be positive");
     }
     let started = std::time::Instant::now();
     progress(
@@ -2274,7 +2349,7 @@ async fn run(job: &Job) -> Result<()> {
     if types::arrow_type(&meta.columns[&job.table.time_column].ty)?
         != types::arrow_type(job.table.time_type.sql())?
     {
-        bail!("window column type does not match table");
+        fail!(InvalidInput, "window column type does not match table");
     }
     job.validate_schema(&schema(&meta)?)?;
     progress(
@@ -2292,7 +2367,10 @@ async fn run(job: &Job) -> Result<()> {
             if let Some(reason) =
                 sources_outside(&tx, meta.table_id, utc_col, &job.table, window, &selected).await?
             {
-                bail!("strict repack would not produce exactly one in-window file: {reason}");
+                fail!(
+                    InvalidInput,
+                    "strict repack would not produce exactly one in-window file: {reason}"
+                );
             }
             window
         }
@@ -2337,7 +2415,7 @@ async fn run(job: &Job) -> Result<()> {
         })
         .await?;
         if job.strictness == Some(Strictness::Raise) && files.len() > 1 {
-            bail!(
+            fail!(InvalidInput,
                 "strict repack produced {} files instead of one in-window file",
                 files.len()
             );
@@ -2372,7 +2450,14 @@ async fn run(job: &Job) -> Result<()> {
                     progress(log, format!("commit failed; retaining candidate files {:?} under {} to avoid \
                         deleting files after an uncertain commit; unreferenced files may be cleaned up later",
                         files.iter().map(|f| &f.name).collect::<Vec<_>>(), meta.root));
-                    return Err(e);
+                    return Err(if is_commit_conflict(&e) {
+                        Error::CommitRetriesExhausted {
+                            attempts: attempt,
+                            source: Box::new(e),
+                        }
+                    } else {
+                        e
+                    });
                 }
             }
         };
@@ -2979,7 +3064,7 @@ mod tests {
             "node",
             0,
             crate::config::DEFAULT_REPACK_NODE_BYTES,
-            async { bail!("injected output write failure") },
+            async { fail!(InvalidInput, "injected output write failure") },
         )
         .await
         .unwrap_err();

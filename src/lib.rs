@@ -1,6 +1,5 @@
 #![doc = include_str!("../README.md")]
 
-use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use config::identifier;
@@ -14,6 +13,8 @@ use datafusion::parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use datafusion::parquet::basic::{Compression, ZstdLevel};
 use datafusion::parquet::file::metadata::ParquetMetaData;
 use datafusion::parquet::file::properties::WriterProperties;
+use error::{Context, fail};
+pub use error::{Error, Result};
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use rustls::{ClientConfig, RootCertStore};
@@ -25,6 +26,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
 pub mod config;
+pub mod error;
 pub mod maintenance;
 pub mod parquet;
 pub mod repack;
@@ -181,7 +183,9 @@ async fn table_meta(c: &impl GenericClient, schema: &str, table: &str) -> Result
         )
         .await
         .context("looking up ducklake table")?
-        .ok_or_else(|| anyhow!("ducklake table {schema}.{table} not found"))?;
+        .ok_or_else(|| Error::TableNotFound {
+            table: format!("{schema}.{table}"),
+        })?;
     let table_id: i64 = row.get(0);
     let t_path: String = row.get(1);
     let t_rel: Option<bool> = row.get(2);
@@ -198,7 +202,10 @@ async fn table_meta(c: &impl GenericClient, schema: &str, table: &str) -> Result
         .await?
         .get(0);
     if partitioned {
-        bail!("{schema}.{table} is partitioned; partitioned registration isn't supported");
+        fail!(
+            UnsupportedFeature,
+            "{schema}.{table} is partitioned; partitioned registration isn't supported"
+        );
     }
 
     let columns = c
@@ -271,7 +278,7 @@ async fn table_tags(c: &impl GenericClient, table_id: i64) -> Result<HashMap<Str
         let key: String = row.get(0);
         let value: String = row.get(1);
         if tags.insert(key.clone(), value).is_some() {
-            bail!("multiple active DuckLake tags for key {key:?}");
+            fail!(InvalidData, "multiple active DuckLake tags for key {key:?}");
         }
     }
     Ok(tags)
@@ -339,7 +346,10 @@ async fn column_tags(c: &impl GenericClient, table_id: i64) -> Result<ColumnTags
             .insert(key.clone(), row.get(2))
             .is_some()
         {
-            bail!("multiple active DuckLake {key:?} tags for column {column_id}");
+            fail!(
+                InvalidData,
+                "multiple active DuckLake {key:?} tags for column {column_id}"
+            );
         }
     }
     Ok(tags)
@@ -496,7 +506,7 @@ fn resolve_levels(
                     );
                     continue;
                 }
-                _ => bail!("unknown repack level rule in tag {key:?}"),
+                _ => fail!(InvalidInput, "unknown repack level rule in tag {key:?}"),
             };
             *slot = Some(interval(intervals, &text)?);
         }
@@ -507,7 +517,7 @@ fn resolve_levels(
 
 pub(crate) async fn resolve_table(builder: TableBuilder) -> Result<Table> {
     if builder.schema.is_empty() || builder.table.is_empty() || builder.table.contains('.') {
-        bail!("table name must have the form schema.table");
+        fail!(InvalidInput, "table name must have the form schema.table");
     }
     identifier(&builder.schema)?;
     identifier(&builder.table)?;
@@ -536,8 +546,26 @@ fn resolve_table_settings(
     column_tags: &ColumnTags,
     intervals: &HashMap<String, maintenance::Interval>,
 ) -> Result<Table> {
-    let time_column = overridden_tag(builder.time_column, tags, TAG_TIME_COLUMN)?
-        .context("missing required table setting \"time_column\"")?;
+    let name = format!("{}.{}", builder.schema, builder.table);
+    resolve_table_settings_inner(builder, meta, tags, column_tags, intervals)
+        .map_err(|error| error.for_table(name))
+}
+
+fn resolve_table_settings_inner(
+    builder: TableBuilder,
+    meta: &TableMeta,
+    tags: &HashMap<String, String>,
+    column_tags: &ColumnTags,
+    intervals: &HashMap<String, maintenance::Interval>,
+) -> Result<Table> {
+    let name = format!("{}.{}", builder.schema, builder.table);
+    let time_column =
+        overridden_tag(builder.time_column, tags, TAG_TIME_COLUMN)?.ok_or_else(|| {
+            Error::MissingRequiredSetting {
+                table: name.clone(),
+                setting: "time_column",
+            }
+        })?;
     let time_col = meta
         .columns
         .get(&time_column)
@@ -552,10 +580,17 @@ fn resolve_table_settings(
                     .with_context(|| format!("invalid timezone tag {zone:?}"))
             })
             .transpose()?
-            .context("missing required table setting \"timezone\"")?,
+            .ok_or_else(|| Error::MissingRequiredSetting {
+                table: name.clone(),
+                setting: "timezone",
+            })?,
     };
-    let sort_cols = overridden_tag(builder.sort_cols, tags, TAG_SORT_COLS)?
-        .context("missing required table setting \"sort_cols\"")?;
+    let sort_cols = overridden_tag(builder.sort_cols, tags, TAG_SORT_COLS)?.ok_or_else(|| {
+        Error::MissingRequiredSetting {
+            table: name,
+            setting: "sort_cols",
+        }
+    })?;
     let row_group_col =
         overridden_tag(builder.row_group_col, tags, TAG_ROW_GROUP_COL)?.unwrap_or(None);
     let unique_by_cols =
@@ -584,7 +619,10 @@ fn resolve_table_settings(
         DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => TimeType::TimestampTz,
         DataType::Timestamp(TimeUnit::Microsecond, None) => TimeType::Timestamp,
         _ => {
-            bail!("configured time column {time_column:?} must be a date or microsecond timestamp")
+            fail!(
+                InvalidInput,
+                "configured time column {time_column:?} must be a date or microsecond timestamp"
+            )
         }
     };
     let table = Table {
@@ -616,7 +654,7 @@ fn resolve_table_settings(
         .chain(table.dedup_timestamp.as_deref())
     {
         if !meta.columns.contains_key(name) {
-            bail!("configured column {name:?} is not in table");
+            fail!(InvalidInput, "configured column {name:?} is not in table");
         }
     }
     if let Some(timestamp) = &table.dedup_timestamp
@@ -625,12 +663,18 @@ fn resolve_table_settings(
             DataType::Timestamp(TimeUnit::Microsecond, _)
         )
     {
-        bail!("dedup timestamp column {timestamp:?} must be a microsecond timestamp");
+        fail!(
+            InvalidInput,
+            "dedup timestamp column {timestamp:?} must be a microsecond timestamp"
+        );
     }
     if let Some(unique) = &table.unique_by_cols {
         for name in unique {
             if !meta.columns.contains_key(name) {
-                bail!("configured unique column {name:?} is not in table");
+                fail!(
+                    InvalidInput,
+                    "configured unique column {name:?} is not in table"
+                );
             }
         }
     }
@@ -648,9 +692,12 @@ fn resolve_columns<'a>(meta: &'a TableMeta, schema: &Schema) -> Result<Vec<&'a C
         let col = meta
             .columns
             .get(f.name())
-            .ok_or_else(|| anyhow!("column {} not in ducklake table", f.name()))?;
+            .ok_or_else(|| Error::InvalidData {
+                reason: format!("column {} not in ducklake table", f.name()),
+            })?;
         if !arrow_type_matches(&col.ty, f.data_type()) {
-            bail!(
+            fail!(
+                InvalidInput,
                 "column {} is {} in ducklake but {} in batch",
                 f.name(),
                 col.ty,
@@ -660,7 +707,8 @@ fn resolve_columns<'a>(meta: &'a TableMeta, schema: &Schema) -> Result<Vec<&'a C
         out.push(col);
     }
     if out.len() != meta.columns.len() {
-        bail!(
+        fail!(
+            InvalidInput,
             "batch has {} columns but ducklake table has {}",
             out.len(),
             meta.columns.len()
@@ -1105,13 +1153,10 @@ pub(crate) async fn update_table_stats(
     Ok(())
 }
 
-fn is_commit_conflict(e: &anyhow::Error) -> bool {
-    e.chain()
-        .filter_map(|c| c.downcast_ref::<tokio_postgres::Error>())
-        .filter_map(|pe| pe.code())
-        .any(|code| {
-            *code == SqlState::UNIQUE_VIOLATION || *code == SqlState::T_R_SERIALIZATION_FAILURE
-        })
+fn is_commit_conflict(error: &Error) -> bool {
+    matches!(error, Error::Catalog { source, .. }
+        if source.code().is_some_and(|code|
+            *code == SqlState::UNIQUE_VIOLATION || *code == SqlState::T_R_SERIALIZATION_FAILURE))
 }
 
 impl Table {
@@ -1138,7 +1183,10 @@ impl Table {
             }
             let column = batch.column(batch.schema().index_of(&self.time_column)?);
             if column.null_count() != 0 {
-                bail!("replacement time column must not contain nulls");
+                fail!(
+                    InvalidInput,
+                    "replacement time column must not contain nulls"
+                );
             }
             let (lo, hi) = match (self.time_type, column.data_type()) {
                 (TimeType::Date, DataType::Date32) => {
@@ -1156,7 +1204,10 @@ impl Table {
                         datafusion::arrow::compute::max(values),
                     )
                 }
-                _ => bail!("replacement time column type does not match table"),
+                _ => fail!(
+                    InvalidInput,
+                    "replacement time column type does not match table"
+                ),
             };
             if let (Some(lo), Some(hi)) = (lo, hi) {
                 minimum = Some(minimum.map_or(lo, |value| value.min(lo)));
@@ -1190,7 +1241,7 @@ impl Table {
     /// when every requested update is already in effect.
     pub async fn update_tags(&self, updates: HashMap<String, Option<String>>) -> Result<i64> {
         if updates.keys().any(|key| key.is_empty()) {
-            bail!("DuckLake tag keys must not be empty");
+            fail!(InvalidInput, "DuckLake tag keys must not be empty");
         }
         let mut client = connect(&self.cfg).await?;
         let tx = client.transaction().await?;
@@ -1231,7 +1282,7 @@ impl Table {
             let key: String = row.get(0);
             let value: String = row.get(1);
             if active.insert(key.clone(), value).is_some() {
-                bail!("multiple active DuckLake tags for key {key:?}");
+                fail!(InvalidData, "multiple active DuckLake tags for key {key:?}");
             }
         }
 
@@ -1290,7 +1341,10 @@ impl Table {
                     .await
                     .with_context(|| format!("ending active DuckLake tag {key:?}"))?;
                 if ended != 1 {
-                    bail!("active DuckLake tag {key:?} changed during update");
+                    fail!(
+                        CatalogChanged,
+                        "active DuckLake tag {key:?} changed during update"
+                    );
                 }
             }
             if let Some(value) = value {
@@ -1321,7 +1375,7 @@ impl Table {
         let (start, end) = self.replacement_bounds(&batches)?;
         for batch in &batches {
             if batch.schema() != batches[0].schema() {
-                bail!("load batch schemas differ");
+                fail!(InvalidInput, "load batch schemas differ");
             }
         }
         (cfg.log)(&format!("{self} [{start}, {end}): replacing window"));
@@ -1333,7 +1387,7 @@ impl Table {
             .get(&table.time_column)
             .context("table has no configured window column")?;
         if types::arrow_type(&utc_col.ty)? != types::arrow_type(table.time_type.sql())? {
-            bail!("window column type does not match table");
+            fail!(InvalidInput, "window column type does not match table");
         }
         let (buf, pq) = write_parquet(&batches, &cols)?;
         let name = format!("ducklake-{}.parquet", Uuid::now_v7());
@@ -1376,7 +1430,13 @@ async fn register(
                 let window = repack::Window { start, end };
                 return repack::replace_window(client, meta, utc_col, table, window, file).await;
             }
-            Err(e) if is_commit_conflict(&e) && attempt < MAX_COMMIT_ATTEMPTS => {
+            Err(e) if is_commit_conflict(&e) => {
+                if attempt == MAX_COMMIT_ATTEMPTS {
+                    return Err(Error::CommitRetriesExhausted {
+                        attempts: attempt,
+                        source: Box::new(e),
+                    });
+                }
                 (table.cfg.log)(&format!(
                     "ducklake commit conflict (attempt {attempt}), retrying: {e:#}"
                 ));
@@ -1385,7 +1445,7 @@ async fn register(
             Err(e) => return Err(e),
         }
     }
-    bail!("could not commit ducklake snapshot after {MAX_COMMIT_ATTEMPTS} attempts")
+    unreachable!("the final attempt returns either a report or an error")
 }
 
 #[cfg(test)]
@@ -1641,17 +1701,35 @@ mod tests {
         let meta = TableMeta {
             table_id: 1,
             root: String::new(),
-            columns: HashMap::new(),
+            columns: HashMap::from([(
+                "observed".into(),
+                Column {
+                    id: 1,
+                    ty: "date".into(),
+                },
+            )]),
         };
-        let error = resolve_table_settings(
-            Table::builder("weather.observations", &Table::default().cfg),
-            &meta,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("time_column"));
+        let mut tags = HashMap::new();
+        for (setting, key, value) in [
+            ("time_column", TAG_TIME_COLUMN, r#""observed""#),
+            ("timezone", TAG_TIMEZONE, r#""UTC""#),
+            ("sort_cols", TAG_SORT_COLS, r#"["observed"]"#),
+        ] {
+            let error = resolve_table_settings(
+                Table::builder("weather.observations", &Table::default().cfg),
+                &meta,
+                &tags,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, Error::MissingRequiredSetting { table, setting: missing }
+                if table == "weather.observations" && *missing == setting),
+                "{error:?}"
+            );
+            tags.insert(key.into(), value.into());
+        }
     }
 
     #[test]

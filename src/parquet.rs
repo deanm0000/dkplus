@@ -163,7 +163,9 @@ impl OutputWriter {
         if let Some(index) = node_idx
             && !types::supported(schema.field(index).data_type())
         {
-            bail!("unsupported row-group column type");
+            return Err(Error::UnsupportedType {
+                data_type: schema.field(index).data_type().to_string(),
+            });
         }
         let writer = AsyncArrowWriter::try_new_with_options(
             BufWriter::new(store.clone(), path.clone()),
@@ -209,7 +211,7 @@ impl OutputWriter {
 
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         if batch.schema() != self.schema {
-            bail!("output batch schema changed while writing");
+            fail!(InvalidInput, "output batch schema changed while writing");
         }
         for (i, stat) in self.stats.iter_mut().enumerate() {
             let (lo, hi, nan) = column_bounds(std::slice::from_ref(batch), i)?;
@@ -244,7 +246,10 @@ impl OutputWriter {
                     .as_deref()
                     .is_some_and(|last| last > node)
             {
-                bail!("row-group keys must be sorted ascending across batches");
+                fail!(
+                    InvalidInput,
+                    "row-group keys must be sorted ascending across batches"
+                );
             }
             if self.groups.boundary(node) {
                 self.writer.flush().await?;

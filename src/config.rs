@@ -1,5 +1,6 @@
+use crate::error::{Context, fail};
 use crate::maintenance::{Granularity, RepackLevel};
-use anyhow::{Context, Result, bail};
+use crate::{Error, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 use object_store::{ObjectStore, azure::MicrosoftAzureBuilder, local::LocalFileSystem};
@@ -26,8 +27,9 @@ impl Storage {
         let root = root
             .canonicalize()
             .context("resolving local storage root")?;
-        let url = url::Url::from_directory_path(&root)
-            .map_err(|()| anyhow::anyhow!("invalid local storage root"))?;
+        let url = url::Url::from_directory_path(&root).map_err(|()| Error::InvalidStoragePath {
+            reason: "invalid local storage root".into(),
+        })?;
         Ok(Self::Store {
             root: url.to_string(),
             store: Arc::new(LocalFileSystem::new_with_prefix(root)?),
@@ -37,6 +39,13 @@ impl Storage {
     /// Resolve a catalog path into a store and relative key. Local stores accept
     /// both file URLs and absolute filesystem paths below their configured root.
     pub fn resolve(&self, path: &str) -> Result<(Arc<dyn ObjectStore>, String)> {
+        self.resolve_inner(path).map_err(|error| match error {
+            Error::InvalidInput { reason } => Error::InvalidStoragePath { reason },
+            other => other,
+        })
+    }
+
+    fn resolve_inner(&self, path: &str) -> Result<(Arc<dyn ObjectStore>, String)> {
         match self {
             Self::Azure {
                 account,
@@ -47,7 +56,7 @@ impl Storage {
                     .context("expected az:// storage path")?;
                 let (container, key) = rest.split_once('/').unwrap_or((rest, ""));
                 if container.is_empty() {
-                    bail!("Azure storage path has no container");
+                    fail!(InvalidInput, "Azure storage path has no container");
                 }
                 let store = MicrosoftAzureBuilder::new()
                     .with_account(account)
@@ -59,16 +68,20 @@ impl Storage {
             }
             Self::Store { root, store } => {
                 if !root.ends_with('/') {
-                    bail!("object-store root must end with '/'");
+                    fail!(InvalidInput, "object-store root must end with '/'");
                 }
                 let mut key = if root.starts_with("file://") {
-                    let local_root = url::Url::parse(root)?
-                        .to_file_path()
-                        .map_err(|()| anyhow::anyhow!("invalid local root URL"))?;
+                    let local_root = url::Url::parse(root)?.to_file_path().map_err(|()| {
+                        Error::InvalidStoragePath {
+                            reason: "invalid local root URL".into(),
+                        }
+                    })?;
                     let local_path = if path.starts_with("file://") {
-                        url::Url::parse(path)?
-                            .to_file_path()
-                            .map_err(|()| anyhow::anyhow!("invalid local catalog URL"))?
+                        url::Url::parse(path)?.to_file_path().map_err(|()| {
+                            Error::InvalidStoragePath {
+                                reason: "invalid local catalog URL".into(),
+                            }
+                        })?
                     } else {
                         std::path::PathBuf::from(path)
                     };
@@ -88,7 +101,10 @@ impl Storage {
                         .to_owned()
                 };
                 if key.split('/').any(|part| part == "." || part == "..") {
-                    bail!("catalog path contains a relative traversal component");
+                    fail!(
+                        InvalidInput,
+                        "catalog path contains a relative traversal component"
+                    );
                 }
                 if path.ends_with('/') && !key.is_empty() && !key.ends_with('/') {
                     key.push('/');
@@ -321,11 +337,16 @@ impl TableBuilder {
 
 impl Table {
     pub fn validate(&self) -> Result<()> {
+        self.validate_settings()
+            .map_err(|error| error.for_table(self))
+    }
+
+    fn validate_settings(&self) -> Result<()> {
         identifier(&self.schema)?;
         identifier(&self.table)?;
         identifier(&self.time_column)?;
         if self.sort_cols.is_empty() {
-            bail!("sort columns must not be empty");
+            fail!(InvalidInput, "sort columns must not be empty");
         }
         for name in &self.sort_cols {
             identifier(name)?;
@@ -333,22 +354,28 @@ impl Table {
         if let Some(name) = &self.row_group_col {
             identifier(name)?;
             if self.sort_cols.first() != Some(name) {
-                bail!("row-group column must be the first sort column");
+                fail!(
+                    InvalidInput,
+                    "row-group column must be the first sort column"
+                );
             }
         }
         if let Some(unique) = &self.unique_by_cols {
             if unique.is_empty() {
-                bail!("unique columns must not be empty");
+                fail!(InvalidInput, "unique columns must not be empty");
             }
             let mut seen = std::collections::HashSet::new();
             for name in unique {
                 identifier(name)?;
                 if !seen.insert(name) {
-                    bail!("unique columns must be distinct");
+                    fail!(InvalidInput, "unique columns must be distinct");
                 }
             }
             if self.dedup_timestamp.is_none() {
-                bail!("deduplication requires a dedup timestamp column");
+                fail!(
+                    InvalidInput,
+                    "deduplication requires a dedup timestamp column"
+                );
             }
         }
         if let Some(name) = &self.dedup_timestamp {
@@ -356,20 +383,30 @@ impl Table {
         }
         if let Some(Granularity::Fixed(step)) = self.granularity {
             if step.is_zero() || !step.is_non_negative() {
-                bail!("granularity must be a positive interval");
+                fail!(InvalidInput, "granularity must be a positive interval");
             }
             if self.time_type == TimeType::Date && step.micros != 0 {
-                bail!("date granularity must be a whole number of days or months");
+                fail!(
+                    InvalidInput,
+                    "date granularity must be a whole number of days or months"
+                );
             }
         }
         let mut seen = std::collections::HashSet::new();
         for level in &self.repack_levels {
             if level.level == 0 || !seen.insert(level.level) {
-                bail!("repack level numbers must be positive and distinct");
+                fail!(
+                    InvalidInput,
+                    "repack level numbers must be positive and distinct"
+                );
             }
             for (rule, value) in level.intervals() {
                 if !matches!(rule, "relage_min" | "relage_max") && !value.is_non_negative() {
-                    bail!("repack level {} {rule} must not be negative", level.level);
+                    fail!(
+                        InvalidInput,
+                        "repack level {} {rule} must not be negative",
+                        level.level
+                    );
                 }
             }
         }
@@ -420,7 +457,10 @@ impl Table {
 
 pub(crate) fn identifier(name: &str) -> Result<String> {
     if name.is_empty() || name.contains('\0') {
-        bail!("SQL identifier must be nonempty and contain no NUL");
+        fail!(
+            InvalidInput,
+            "SQL identifier must be nonempty and contain no NUL"
+        );
     }
     Ok(format!("\"{}\"", name.replace('"', "\"\"")))
 }
@@ -505,8 +545,14 @@ mod tests {
                 .1,
             "table/file.parquet"
         );
-        assert!(storage.resolve("memory:///database/file.parquet").is_err());
-        assert!(storage.resolve("memory:///data/../file.parquet").is_err());
+        assert!(matches!(
+            storage.resolve("memory:///database/file.parquet"),
+            Err(Error::InvalidStoragePath { .. })
+        ));
+        assert!(matches!(
+            storage.resolve("memory:///data/../file.parquet"),
+            Err(Error::InvalidStoragePath { .. })
+        ));
         assert_eq!(identifier("odd\"name").unwrap(), "\"odd\"\"name\"");
         assert!(identifier("").is_err());
     }

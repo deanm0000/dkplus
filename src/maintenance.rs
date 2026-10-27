@@ -1,7 +1,8 @@
 //! Tag-driven repack planning and expired-file cleanup; callers own scheduling.
+use crate::error::{Context, fail};
 use crate::repack::{Bound, ExpireSnapshot, Strictness};
+use crate::{Error, Result};
 use crate::{Table, TimeType, connect, table_meta, types};
-use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, Utc};
 use datafusion::arrow::datatypes::DataType;
 use serde::{Deserialize, Serialize};
@@ -51,7 +52,10 @@ fn column_time_type(ty: &str) -> Result<TimeType> {
         DataType::Date32 => TimeType::Date,
         DataType::Timestamp(_, Some(_)) => TimeType::TimestampTz,
         DataType::Timestamp(_, None) => TimeType::Timestamp,
-        other => bail!("dedup timestamp column type {other} is not a date or timestamp"),
+        other => fail!(
+            InvalidInput,
+            "dedup timestamp column type {other} is not a date or timestamp"
+        ),
     })
 }
 
@@ -99,7 +103,8 @@ async fn load_files(client: &impl GenericClient, table: &Table) -> Result<Vec<pl
             let min: Option<DateTime<Utc>> = row.try_get(1)?;
             let max: Option<DateTime<Utc>> = row.try_get(2)?;
             let (Some(min), Some(max)) = (min, max) else {
-                bail!(
+                fail!(
+                    InvalidData,
                     "{table}: file {path} has missing or null {} statistics",
                     table.time_column
                 );
@@ -148,7 +153,10 @@ pub async fn find_potential_repacks(
     }
     let granularity = table
         .granularity
-        .with_context(|| format!("{table}: finding repacks requires a granularity tag"))?;
+        .ok_or_else(|| Error::MissingRequiredSetting {
+            table: table.to_string(),
+            setting: "granularity",
+        })?;
     let files = load_files(client, table).await?;
     let context = context(table, granularity, &files);
     let mut entries = Vec::new();
@@ -211,7 +219,11 @@ pub async fn do_repack(
     strictness: Strictness,
 ) -> Result<RepackOutcome> {
     if repack.table != table.to_string() {
-        bail!("repack is for {} but table is {table}", repack.table);
+        fail!(
+            InvalidInput,
+            "repack is for {} but table is {table}",
+            repack.table
+        );
     }
     let files = {
         let mut client = connect(&table.cfg).await?;

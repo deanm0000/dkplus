@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, bail};
+use crate::error::{Context, fail};
+use crate::{Error, Result};
 use chrono::{DateTime, NaiveDate};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use datafusion::arrow::compute;
@@ -24,7 +25,11 @@ pub(crate) fn arrow_type(ty: &str) -> Result<DataType> {
         "date" => DataType::Date32,
         "timestamp" | "timestamp_us" => DataType::Timestamp(TimeUnit::Microsecond, None),
         "timestamptz" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        _ => bail!("unsupported DuckLake column type {ty}"),
+        _ => {
+            return Err(Error::UnsupportedType {
+                data_type: ty.into(),
+            });
+        }
     })
 }
 
@@ -72,7 +77,11 @@ pub(crate) fn catalog_type(dt: &DataType) -> Result<&'static str> {
         DataType::Date32 => "date",
         DataType::Timestamp(TimeUnit::Microsecond, None) => "timestamp",
         DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => "timestamptz",
-        _ => bail!("unsupported column type {dt}"),
+        _ => {
+            return Err(Error::UnsupportedType {
+                data_type: dt.to_string(),
+            });
+        }
     })
 }
 
@@ -106,7 +115,9 @@ pub(crate) fn bounds(
 ) -> Result<(Option<String>, Option<String>, Option<bool>)> {
     let dt = batches[0].schema().field(index).data_type().clone();
     if !supported(&dt) {
-        bail!("unsupported column type {dt}");
+        return Err(Error::UnsupportedType {
+            data_type: dt.to_string(),
+        });
     }
     let float = matches!(dt, DataType::Float32 | DataType::Float64);
     let (mut min, mut max): (Option<ScalarValue>, Option<ScalarValue>) = (None, None);
@@ -205,7 +216,11 @@ fn array_bounds(array: &ArrayRef) -> Result<(Option<ScalarValue>, Option<ScalarV
                 false,
             )
         }
-        other => bail!("unsupported column type {other}"),
+        other => {
+            return Err(Error::UnsupportedType {
+                data_type: other.to_string(),
+            });
+        }
     })
 }
 
@@ -242,7 +257,10 @@ pub(crate) fn compare(ty: &str, a: &str, b: &str) -> Option<Ordering> {
 /// Order-preserving encoded scalar keys, shared by the writer and aligned repack.
 pub(crate) fn keys(array: &ArrayRef) -> Result<Vec<String>> {
     if !supported(array.data_type()) || array.null_count() != 0 {
-        bail!("row-group keys must be supported non-null scalars");
+        fail!(
+            InvalidData,
+            "row-group keys must be supported non-null scalars"
+        );
     }
     if let Some(strings) = array
         .as_any()
@@ -275,7 +293,7 @@ pub(crate) fn statistics_key(dt: &DataType, bytes: &[u8]) -> Result<String> {
         DataType::Utf8 => ScalarValue::Utf8(Some(std::str::from_utf8(bytes)?.into())),
         DataType::Boolean => {
             if bytes.len() != 1 || bytes[0] > 1 {
-                bail!("invalid boolean statistic");
+                fail!(InvalidData, "invalid boolean statistic");
             }
             ScalarValue::Boolean(Some(bytes[0] != 0))
         }
@@ -293,10 +311,17 @@ pub(crate) fn statistics_key(dt: &DataType, bytes: &[u8]) -> Result<String> {
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             ScalarValue::TimestampMicrosecond(Some(read!(i64)), tz.clone())
         }
-        _ => bail!("unsupported row-group statistics type {dt}"),
+        _ => {
+            return Err(Error::UnsupportedType {
+                data_type: dt.to_string(),
+            });
+        }
     };
     if is_nan(&value) {
-        bail!("NaN row-group statistics cannot prove exact bounds");
+        fail!(
+            InvalidData,
+            "NaN row-group statistics cannot prove exact bounds"
+        );
     }
     Ok(keys(&value.to_array_of_size(1)?)?.remove(0))
 }

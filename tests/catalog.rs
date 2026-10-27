@@ -51,7 +51,7 @@ INSERT INTO ducklake.ducklake_snapshot VALUES (0, now(), 0, 1, 1);
 INSERT INTO ducklake.ducklake_schema VALUES (1, 'weather', 'weather/', true, NULL);
 ";
 
-async fn run(cfg: &Config, job: &dkplus::repack::Job, log: &mut Vec<String>) -> anyhow::Result<()> {
+async fn run(cfg: &Config, job: &dkplus::repack::Job, log: &mut Vec<String>) -> dkplus::Result<()> {
     let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = messages.clone();
     let mut job = job.clone();
@@ -140,6 +140,94 @@ async fn expiry_fixture(
 
 async fn count(client: &tokio_postgres::Client, sql: &str) -> i64 {
     client.query_one(sql, &[]).await.unwrap().get(0)
+}
+
+#[tokio::test]
+#[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+async fn typed_errors_preserve_catalog_sources_and_retry_exhaustion() {
+    use dkplus::Error;
+    use tokio_postgres::error::SqlState;
+
+    let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    let (cfg, job, _) = expiry_fixture(&client, &postgres).await;
+    assert!(matches!(cfg.table("weather.missing").await.unwrap_err(),
+        Error::TableNotFound { table } if table == "weather.missing"));
+    let error = dkplus::tags::update(
+        &postgres,
+        serde_json::from_value(serde_json::json!({
+            "weather.observations": { "sort_cols": [] }
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidConfiguration { table, .. }
+        if table == "weather.observations"));
+
+    let error = dkplus::tags::update(
+        &postgres,
+        serde_json::from_value(serde_json::json!({
+            "weather.observations": { "granularity": "not an interval" }
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap_err();
+    let Error::Catalog { operation, source } = error else {
+        panic!("{error:?}")
+    };
+    assert!(operation.contains("parsing interval tag value"));
+    assert_eq!(source.code(), Some(&SqlState::INVALID_DATETIME_FORMAT));
+
+    client
+        .batch_execute(
+            "CREATE SEQUENCE ducklake.commit_attempts;
+         CREATE FUNCTION ducklake.reject_commit() RETURNS trigger LANGUAGE plpgsql AS
+         $$ BEGIN
+             PERFORM nextval('ducklake.commit_attempts');
+             RAISE EXCEPTION 'injected serialization conflict' USING ERRCODE = '40001';
+         END $$;
+         CREATE TRIGGER reject_commit BEFORE INSERT ON ducklake.ducklake_snapshot
+         FOR EACH ROW EXECUTE FUNCTION ducklake.reject_commit();",
+        )
+        .await
+        .unwrap();
+    let error = run(&cfg, &job, &mut Vec::new()).await.unwrap_err();
+    let Error::CommitRetriesExhausted { attempts, source } = error else {
+        panic!("{error:?}")
+    };
+    assert_eq!(attempts, 6);
+    let Error::Catalog { source, .. } = source.as_ref() else {
+        panic!("{source:?}")
+    };
+    assert_eq!(source.code(), Some(&SqlState::T_R_SERIALIZATION_FAILURE));
+    assert_eq!(
+        source.as_db_error().unwrap().message(),
+        "injected serialization conflict"
+    );
+    assert_eq!(
+        count(&client, "SELECT last_value FROM ducklake.commit_attempts").await,
+        6
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT max(snapshot_id) FROM ducklake.ducklake_snapshot"
+        )
+        .await,
+        1
+    );
+    client
+        .batch_execute("DROP SCHEMA ducklake CASCADE")
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap();
 }
 
 #[tokio::test]
@@ -532,7 +620,13 @@ async fn merge_diff_publishes_both_tables_atomically_and_preserves_unmatched_row
         )
         .await
         .unwrap_err();
-    assert!(format!("{error:#}").contains("reject_diff"));
+    let dkplus::Error::Catalog { source, .. } = error else {
+        panic!("{error:?}")
+    };
+    assert_eq!(
+        source.as_db_error().unwrap().constraint(),
+        Some("reject_diff")
+    );
     assert_eq!(
         count(
             &client,

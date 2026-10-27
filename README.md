@@ -11,7 +11,6 @@ dkplus = { path = "../dkplus" } # adjust relative to the consuming Cargo.toml
 datafusion = "55"             # compatible Arrow 59 / Parquet 59 types
 object_store = "0.13"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-anyhow = "1"
 ```
 
 Keep Arrow/Parquet/object_store versions compatible across the consumer and this
@@ -32,7 +31,7 @@ use dkplus::parquet::{Grouping, ParquetWriter};
 use object_store::{memory::InMemory, path::Path};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> dkplus::Result<()> {
     let store = Arc::new(InMemory::new());
     let schema = Arc::new(Schema::new(vec![Field::new("station", DataType::Int32, false)]));
     let mut writer = ParquetWriter::new(
@@ -152,7 +151,7 @@ use dkplus::config::{DEFAULT_REPACK_NODE_BYTES, DEFAULT_REPACK_RUN_BYTES};
 use object_store::memory::InMemory;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config {
         postgres: std::env::var("DATABASE_URL")?.parse()?,
         storage: Storage::Store {
@@ -232,7 +231,7 @@ use dkplus::{Config, Table, Storage};
 use dkplus::config::{DEFAULT_REPACK_NODE_BYTES, DEFAULT_REPACK_RUN_BYTES};
 use std::sync::Arc;
 
-async fn build() -> anyhow::Result<Table> {
+async fn build() -> dkplus::Result<Table> {
     let cfg = Config {
         postgres: "host=localhost user=ducklake dbname=catalog".parse()?,
         storage: Storage::local(std::path::Path::new("/data/lake"))?,
@@ -360,7 +359,7 @@ writes. Use this crate's API:
 ```rust,no_run
 use std::collections::HashMap;
 
-async fn update_policy(table: &dkplus::Table) -> anyhow::Result<i64> {
+async fn update_policy(table: &dkplus::Table) -> dkplus::Result<i64> {
     let snapshot_id = table.update_tags(HashMap::from([
         ("dkplus.time_column".into(), Some(r#""observed""#.into())),
         ("dkplus.timezone".into(), Some(r#""America/New_York""#.into())),
@@ -394,7 +393,7 @@ use datafusion::arrow::{
 };
 use dkplus::Table;
 
-async fn load(table: &Table) -> anyhow::Result<()> {
+async fn load(table: &Table) -> dkplus::Result<()> {
     let ts = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
     let schema = Arc::new(Schema::new(vec![
         Field::new("station", DataType::Int32, false),
@@ -453,7 +452,7 @@ across repeated calls.
 use datafusion::arrow::array::RecordBatch;
 use dkplus::Table;
 
-async fn merge(table: &Table, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
+async fn merge(table: &Table, batches: Vec<RecordBatch>) -> dkplus::Result<()> {
     let report = table.merge_diff(batches, "entries_diff").await?;
     println!("snapshot {}: {} target rows, {} history rows",
         report.target.snapshot_id,
@@ -482,7 +481,7 @@ real data.
 ```rust,no_run
 use dkplus::{Table, maintenance, repack::Strictness};
 
-async fn find(table: &Table) -> anyhow::Result<Vec<String>> {
+async fn find(table: &Table) -> dkplus::Result<Vec<String>> {
     // Serialized repacks can be sent to remote workers.
     table
         .find_potential_repacks()
@@ -492,7 +491,7 @@ async fn find(table: &Table) -> anyhow::Result<Vec<String>> {
         .collect()
 }
 
-async fn work(table: &Table, message: &str) -> anyhow::Result<()> {
+async fn work(table: &Table, message: &str) -> dkplus::Result<()> {
     // `table` is resolved on the worker; the message holds only the plan.
     let repack: maintenance::PotentialRepack = serde_json::from_str(message)?;
     match maintenance::do_repack(table, &repack, Strictness::Raise).await? {
@@ -741,7 +740,7 @@ or device ID). You pick it once, in the `Table`, and it must also be the first o
 `sort_cols`:
 
 ```rust,no_run
-async fn configure(cfg: &dkplus::Config) -> anyhow::Result<()> {
+async fn configure(cfg: &dkplus::Config) -> dkplus::Result<()> {
     let _layout = dkplus::Table::builder("weather.observations", cfg)
         .with_timezone(chrono_tz::UTC) // Optional if the column's dkplus.timezone tag is set.
         .with_row_group_col("station") // Optional if DuckLake's dkplus.row_group_col tag is set.
@@ -813,7 +812,7 @@ use dkplus::{Config, maintenance::{
     CleanupOptions, CleanupScope, cleanup_expired_files,
 }};
 
-async fn cleanup(cfg: &Config) -> anyhow::Result<()> {
+async fn cleanup(cfg: &Config) -> dkplus::Result<()> {
     let mut options = CleanupOptions {
         scope: CleanupScope::Table {
             schema: "weather".into(),
@@ -879,15 +878,48 @@ location a catalog path points at, resolve it:
 ```rust,no_run
 use dkplus::Storage;
 
-fn resolve(storage: &Storage) -> anyhow::Result<()> {
+fn resolve(storage: &Storage) -> dkplus::Result<()> {
     let (store, key) = storage.resolve("az://container/lake/table/file.parquet")?;
     let _ = (store, key); // feed into ParquetWriter::new(store, Path::from(key), ...)
     Ok(())
 }
 ```
 
-Errors are `anyhow::Result`; use `dkplus::connect(&cfg)` directly for a
-TLS-enabled `tokio_postgres::Client` when you need ad hoc catalog queries.
+Use `dkplus::connect(&cfg)` directly for a TLS-enabled `tokio_postgres::Client`
+when you need ad hoc catalog queries.
+
+## Errors
+
+All fallible operations return `dkplus::Result<T>`, an alias for
+`std::result::Result<T, dkplus::Error>`. `Error` is a non-exhaustive enum:
+callers can match categories without parsing messages, and must include a
+wildcard arm for future variants.
+
+```rust
+use dkplus::Error;
+
+fn describe(error: &Error) -> String {
+    match error {
+        Error::MissingRequiredSetting { table, setting } =>
+            format!("Set {setting} on {table} before retrying"),
+        Error::InvalidConfiguration { table, reason } =>
+            format!("Correct the policy for {table}: {reason}"),
+        Error::TableNotFound { table } => format!("Create or select table {table}"),
+        Error::Catalog { source, .. } =>
+            format!("Catalog failure (SQLSTATE {:?}): {source}", source.code()),
+        _ => error.to_string(),
+    }
+}
+```
+
+Validation failures distinguish invalid input, invalid table configuration,
+invalid stored data, unsafe storage paths, and unsupported types/features.
+`CatalogChanged` reports stale metadata detected during publication.
+`CommitRetriesExhausted` includes the attempt count and last catalog failure.
+Catalog, object-store, I/O, Arrow, Parquet, query, JSON, URL, TLS, timezone, and
+conversion failures preserve their concrete source errors, accessible through
+the variant fields or `std::error::Error::source`. Operation context is retained
+without replacing those sources with strings.
 
 ## Backends and scalar types
 

@@ -1,5 +1,6 @@
 use super::{ExpireSnapshot, Source, TableMeta, location};
-use anyhow::{Context, Result, bail};
+use crate::Result;
+use crate::error::{Context, fail};
 use tokio_postgres::Transaction;
 
 pub(super) async fn lock(tx: &Transaction<'_>) -> Result<()> {
@@ -49,7 +50,10 @@ pub(super) async fn snapshots(
             .await
             .context("expiring repack predecessor snapshot")?;
         if n != 1 {
-            bail!("repack predecessor snapshot changed before expiry");
+            fail!(
+                CatalogChanged,
+                "repack predecessor snapshot changed before expiry"
+            );
         }
     }
     // Keep snapshot_changes: transactions that started before expiry still need
