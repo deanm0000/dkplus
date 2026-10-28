@@ -386,6 +386,24 @@ snapshot; unchanged requests do not create a new snapshot.
 
 ### 2. Write to DuckLake
 
+For a table partitioned by a single identity `VARCHAR` column, use
+`table.replace_partition_window(batches, "market_type", "dam").await?`.
+It infers the same time window as `replace_window`, but replaces only that
+partition. Every input row must include the same non-null Utf8 partition value.
+The existing table tags still determine time and sort policy. Files overlapping
+the window are rewritten to preserve rows outside it; other partitions are
+untouched. New and rewritten files carry the current `partition_id` and
+`ducklake_file_partition_value` identity metadata, and remain readable by DuckLake.
+The partition value is passed as a SQL parameter, not interpolated into SQL.
+
+Only a single identity string key is supported. Overlapping legacy/mixed files,
+files from older partition specifications, null partition metadata, and inlined
+rows in the time window are rejected before catalog mutation; migrate/flush
+these through DuckLake first. Unrelated partitions' inlined rows also require
+flushing. Partition specifications are rechecked at commit. Plain
+`replace_window` and maintenance/repack APIs still reject partitioned tables.
+Partition-aware replacement never expires historical snapshots.
+
 `Table::replace_window` atomically replaces the inferred half-open window with one
 new Parquet file and one catalog snapshot. Empty batches are ignored; at least one
 row is required. Nonempty batches must share one schema and use column names/types
@@ -979,6 +997,19 @@ These tests cover memory/filesystem load and repack publication, all supported
 scalar mappings/statistics, date/naive/aware windows, typed grouping/fastpack,
 external sorting, deduplication, row IDs, exact group boundaries and thresholds.
 They create catalog fixtures, not real Azure queues or production data.
+
+An optional real DuckLake interoperability regression creates a PostgreSQL
+catalog through DuckDB, replaces one partition (including straddling files), and
+reopens it through DuckLake to verify isolation, metadata and snapshot reads:
+
+```sh
+DKPLUS_TEST_DATABASE_URL='postgresql://user@localhost/empty_testdb' \
+DKPLUS_DUCKLAKE_PYTHON='/path/to/python-with-duckdb' \
+  cargo test --test partition_window -- --ignored
+```
+
+The Python environment must have the DuckLake and PostgreSQL DuckDB extensions
+available. Use an isolated empty database; the test removes its catalog afterward.
 
 Cleanup regressions use a separate **isolated, empty** Postgres database:
 

@@ -144,6 +144,7 @@ pub(crate) async fn run(
             match commit(
                 &mut client,
                 CommitContext {
+                    partition: None,
                     meta: &meta,
                     utc_col: utc_col.id,
                     selected: &selected,

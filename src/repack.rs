@@ -443,7 +443,7 @@ impl Work {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct Source {
+pub(crate) struct Source {
     id: i64,
     path: String,
     relative: bool,
@@ -451,6 +451,132 @@ struct Source {
     row_id_start: Option<i64>,
     begin_snapshot: i64,
     delete: Option<DeleteFile>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct PartitionScope {
+    id: i64,
+    column: String,
+    value: String,
+}
+
+impl PartitionScope {
+    pub(crate) async fn read(
+        c: &impl GenericClient,
+        meta: &TableMeta,
+        column: &str,
+        value: &str,
+    ) -> Result<Self> {
+        let rows = c
+            .query(
+                "SELECT p.partition_id, pc.partition_key_index, pc.column_id, pc.transform
+               FROM ducklake.ducklake_partition_info p
+               LEFT JOIN ducklake.ducklake_partition_column pc
+                 ON pc.partition_id = p.partition_id AND pc.table_id = p.table_id
+              WHERE p.table_id = $1 AND p.end_snapshot IS NULL",
+                &[&meta.table_id],
+            )
+            .await?;
+        let col = meta
+            .columns
+            .get(column)
+            .context("partition column does not exist")?;
+        if rows.len() != 1
+            || rows[0].get::<_, Option<i64>>(1) != Some(0)
+            || rows[0].get::<_, Option<i64>>(2) != Some(col.id)
+            || rows[0].get::<_, Option<String>>(3).as_deref() != Some("identity")
+            || types::arrow_type(&col.ty)? != DataType::Utf8
+        {
+            fail!(
+                UnsupportedFeature,
+                "partition replacement requires exactly one identity VARCHAR partition on {column}"
+            );
+        }
+        Ok(Self {
+            id: rows[0].get(0),
+            column: column.into(),
+            value: value.into(),
+        })
+    }
+
+    pub(crate) fn validate_batches(&self, batches: &[RecordBatch]) -> Result<()> {
+        for batch in batches {
+            let values = batch
+                .column_by_name(&self.column)
+                .context("input is missing the partition column")?
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .context("input partition column must be Utf8")?;
+            if values
+                .iter()
+                .any(|value| value != Some(self.value.as_str()))
+            {
+                fail!(
+                    InvalidInput,
+                    "every input row must have partition {} = {:?}",
+                    self.column,
+                    self.value
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn register(&self, tx: &impl GenericClient, table_id: i64, file_id: i64) -> Result<()> {
+        tx.execute(
+            "UPDATE ducklake.ducklake_data_file SET partition_id = $1
+              WHERE table_id = $2 AND data_file_id = $3",
+            &[&self.id, &table_id, &file_id],
+        )
+        .await?;
+        tx.execute(
+            "INSERT INTO ducklake.ducklake_file_partition_value
+             (data_file_id, table_id, partition_key_index, partition_value) VALUES ($1,$2,0,$3)",
+            &[&file_id, &table_id, &self.value],
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+pub(crate) async fn partition_sources(
+    c: &impl GenericClient,
+    meta: &TableMeta,
+    utc_col: i64,
+    table: &Table,
+    window: Window,
+    scope: &PartitionScope,
+) -> Result<Vec<Source>> {
+    check_inlined(c, meta.table_id, table, window).await?;
+    let candidates = sources(c, meta.table_id, utc_col, table, window).await?;
+    let mut selected = Vec::new();
+    for source in candidates {
+        let rows = c
+            .query(
+                "SELECT f.partition_id, v.partition_key_index, v.partition_value
+               FROM ducklake.ducklake_data_file f
+               LEFT JOIN ducklake.ducklake_file_partition_value v
+                 ON v.table_id = f.table_id AND v.data_file_id = f.data_file_id
+              WHERE f.table_id = $1 AND f.data_file_id = $2",
+                &[&meta.table_id, &source.id],
+            )
+            .await?;
+        if rows.len() != 1
+            || rows[0].get::<_, Option<i64>>(0) != Some(scope.id)
+            || rows[0].get::<_, Option<i64>>(1) != Some(0)
+            || rows[0].get::<_, Option<String>>(2).is_none()
+        {
+            fail!(
+                UnsupportedFeature,
+                "overlapping source {} has legacy, mixed, null or unsupported partition metadata; migrate it with DuckLake before partition replacement",
+                source.id
+            );
+        }
+        if rows[0].get::<_, String>(2) == scope.value {
+            selected.push(source);
+        }
+    }
+    Ok(selected)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1902,6 +2028,7 @@ struct CommitContext<'a> {
     files: &'a [FileInfo],
     replacement: Option<&'a crate::FileInfo>,
     diff: Option<merge_diff::DiffCommit<'a>>,
+    partition: Option<&'a PartitionScope>,
 }
 
 async fn commit(
@@ -1917,6 +2044,7 @@ async fn commit(
         files,
         replacement,
         diff,
+        partition,
     } = context;
     let diff_file = diff
         .as_ref()
@@ -1941,7 +2069,11 @@ async fn commit(
         .await?;
     let (prev, version, next_catalog, next_file): (i64, i64, i64, i64) =
         (snap.get(0), snap.get(1), snap.get(2), snap.get(3));
-    let current = sources(&tx, meta.table_id, utc_col, &job.table, window).await?;
+    let current = if let Some(scope) = partition {
+        partition_sources(&tx, meta, utc_col, &job.table, window, scope).await?
+    } else {
+        sources(&tx, meta.table_id, utc_col, &job.table, window).await?
+    };
     if current != selected {
         fail!(
             CatalogChanged,
@@ -1953,11 +2085,19 @@ async fn commit(
     }
     // A schema change can leave the same files active. Reject rather than publish stale field IDs.
     let (schema_name, table_name) = job.names();
-    if table_meta(&tx, schema_name, table_name).await? != *meta {
+    if table_meta_inner(&tx, schema_name, table_name, partition.is_some()).await? != *meta {
         fail!(
             CatalogChanged,
             "table metadata changed while sorting; retry the job"
         );
+    }
+    if let Some(scope) = partition {
+        if PartitionScope::read(&tx, meta, &scope.column, &scope.value).await? != *scope {
+            fail!(
+                CatalogChanged,
+                "partition specification changed while replacing"
+            );
+        }
     }
     if let Some(diff) = &diff {
         if table_meta(&tx, &diff.table.schema, &diff.table.table).await? != *diff.meta {
@@ -2000,7 +2140,7 @@ async fn commit(
         ],
     )
     .await?;
-    let inlined_removed = if replacement.is_some() {
+    let inlined_removed = if replacement.is_some() && partition.is_none() {
         retire_inlined_rows(&tx, meta.table_id, &job.table, window, snapshot_id).await?
     } else {
         0
@@ -2090,6 +2230,9 @@ async fn commit(
             ],
         )
         .await?;
+        if let Some(scope) = partition {
+            scope.register(&tx, meta.table_id, id).await?;
+        }
         for s in &file.stats {
             tx.execute(
                 "INSERT INTO ducklake.ducklake_file_column_stats
@@ -2114,6 +2257,9 @@ async fn commit(
     let replacement_id = if let Some(file) = replacement {
         let id = next_file + files.len() as i64;
         append_file(&tx, meta, snapshot_id, id, file).await?;
+        if let Some(scope) = partition {
+            scope.register(&tx, meta.table_id, id).await?;
+        }
         Some(id)
     } else {
         None
@@ -2225,6 +2371,7 @@ pub(crate) async fn replace_window(
     table: &Table,
     window: Window,
     incoming: &crate::FileInfo,
+    partition: Option<&PartitionScope>,
 ) -> Result<crate::LoadReport> {
     if table.cfg.repack_run_bytes == 0 || table.cfg.repack_node_bytes == 0 {
         fail!(InvalidInput, "repack memory budgets must be positive");
@@ -2252,7 +2399,11 @@ pub(crate) async fn replace_window(
         .read_only(true)
         .start()
         .await?;
-    let selected = sources(&tx, meta.table_id, utc_col, table, window).await?;
+    let selected = if let Some(scope) = partition {
+        partition_sources(&tx, meta, utc_col, table, window, scope).await?
+    } else {
+        sources(&tx, meta.table_id, utc_col, table, window).await?
+    };
     tx.commit().await?;
 
     let (store, prefix) = object_store_for(&table.cfg, &meta.root)?;
@@ -2292,6 +2443,7 @@ pub(crate) async fn replace_window(
                     files: &files,
                     replacement: Some(incoming),
                     diff: None,
+                    partition,
                 },
             )
             .await
@@ -2505,6 +2657,7 @@ async fn run(job: &Job) -> Result<()> {
                     files: &files,
                     replacement: None,
                     diff: None,
+                    partition: None,
                 },
             )
             .await

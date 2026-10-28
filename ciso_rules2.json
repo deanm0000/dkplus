@@ -1,0 +1,18 @@
+{
+  "ciso.nomogram_shadows": {
+    "time_column": "utcbegin",
+    "unique_by_cols": ["market_type", "utcbegin", "nomogram","constraint_cause"],
+    "dedup_timestamp": "downloaded_at",
+    "sort_cols": ["market_type", "utcbegin", "nomogram","constraint_cause"],
+    "timezone": "America/Los_Angeles",
+    "granularity": "unpredictable"
+  },
+  "ciso.intertie_shadows": {
+    "time_column": "utcbegin",
+    "unique_by_cols": ["market_type", "utcbegin", "intertie","direction","limit_type","constraint_cause"],
+    "dedup_timestamp": "downloaded_at",
+    "sort_cols": ["market_type", "utcbegin", "intertie","direction","limit_type","constraint_cause"],
+    "timezone": "America/Los_Angeles",
+    "granularity": "unpredictable"
+  }
+}

@@ -170,6 +170,15 @@ async fn has_inlined_rows(
 }
 
 async fn table_meta(c: &impl GenericClient, schema: &str, table: &str) -> Result<TableMeta> {
+    table_meta_inner(c, schema, table, false).await
+}
+
+async fn table_meta_inner(
+    c: &impl GenericClient,
+    schema: &str,
+    table: &str,
+    allow_partitioned: bool,
+) -> Result<TableMeta> {
     let row = c
         .query_opt(
             "SELECT t.table_id, t.path, t.path_is_relative, s.path, s.path_is_relative,
@@ -201,7 +210,7 @@ async fn table_meta(c: &impl GenericClient, schema: &str, table: &str) -> Result
         )
         .await?
         .get(0);
-    if partitioned {
+    if partitioned && !allow_partitioned {
         fail!(
             UnsupportedFeature,
             "{schema}.{table} is partitioned; partitioned registration isn't supported"
@@ -464,7 +473,7 @@ pub(crate) async fn resolve_table(builder: TableBuilder) -> Result<Table> {
         .read_only(true)
         .start()
         .await?;
-    let meta = table_meta(&tx, &builder.schema, &builder.table).await?;
+    let meta = table_meta_inner(&tx, &builder.schema, &builder.table, true).await?;
     let tags = table_tags(&tx, meta.table_id).await?;
     let intervals = parse_intervals(&tx, interval_texts(&builder, &tags)?).await?;
     tx.commit()
@@ -1294,6 +1303,30 @@ impl Table {
     /// Replace the range from the minimum through maximum input time, inclusive.
     /// The half-open upper bound is one day (date) or microsecond (timestamp) later.
     pub async fn replace_window(&self, batches: Vec<RecordBatch>) -> Result<LoadReport> {
+        self.replace_window_inner(batches, None).await
+    }
+
+    /// Replace an inferred time window in one identity VARCHAR partition.
+    ///
+    /// Every input row must contain the supplied, non-null partition value.
+    /// Overlapping legacy/unpartitioned files and inlined rows must first be
+    /// migrated/flushed by DuckLake; they are rejected without publishing changes.
+    pub async fn replace_partition_window(
+        &self,
+        batches: Vec<RecordBatch>,
+        partition_column: &str,
+        partition_value: &str,
+    ) -> Result<LoadReport> {
+        identifier(partition_column)?;
+        self.replace_window_inner(batches, Some((partition_column, partition_value)))
+            .await
+    }
+
+    async fn replace_window_inner(
+        &self,
+        batches: Vec<RecordBatch>,
+        partition: Option<(&str, &str)>,
+    ) -> Result<LoadReport> {
         let table = self;
         let cfg = &self.cfg;
         self.validate()?;
@@ -1306,7 +1339,15 @@ impl Table {
         }
         (cfg.log)(&format!("{self} [{start}, {end}): replacing window"));
         let mut client = connect(cfg).await?;
-        let meta = table_meta(&client, &table.schema, &table.table).await?;
+        let meta =
+            table_meta_inner(&client, &table.schema, &table.table, partition.is_some()).await?;
+        let partition = if let Some((column, value)) = partition {
+            let scope = repack::PartitionScope::read(&client, &meta, column, value).await?;
+            scope.validate_batches(&batches)?;
+            Some(scope)
+        } else {
+            None
+        };
         let cols = resolve_columns(&meta, &batches[0].schema())?;
         let utc_col = meta
             .columns
@@ -1314,6 +1355,17 @@ impl Table {
             .context("table has no configured window column")?;
         if types::arrow_type(&utc_col.ty)? != types::arrow_type(table.time_type.sql())? {
             fail!(InvalidInput, "window column type does not match table");
+        }
+        if let Some(scope) = &partition {
+            repack::partition_sources(
+                &client,
+                &meta,
+                utc_col.id,
+                table,
+                repack::Window { start, end },
+                scope,
+            )
+            .await?;
         }
         let (buf, pq) = write_parquet(&batches, &cols)?;
         let name = format!("ducklake-{}.parquet", Uuid::now_v7());
@@ -1324,7 +1376,20 @@ impl Table {
             .put(&obj, PutPayload::from(Bytes::from(buf)))
             .await
             .with_context(|| format!("uploading {}{}", meta.root, file.name))?;
-        let result = register(&mut client, table, &meta, utc_col.id, start, end, &file).await;
+        let result = if let Some(scope) = &partition {
+            repack::replace_window(
+                &mut client,
+                &meta,
+                utc_col.id,
+                table,
+                repack::Window { start, end },
+                &file,
+                Some(scope),
+            )
+            .await
+        } else {
+            register(&mut client, table, &meta, utc_col.id, start, end, &file).await
+        };
         if result.is_err()
             && let Err(e) = store.delete(&obj).await
         {
@@ -1354,7 +1419,8 @@ async fn register(
             Ok(Attempt::Done(report)) => return Ok(report),
             Ok(Attempt::NeedsRewrite) => {
                 let window = repack::Window { start, end };
-                return repack::replace_window(client, meta, utc_col, table, window, file).await;
+                return repack::replace_window(client, meta, utc_col, table, window, file, None)
+                    .await;
             }
             Err(e) if is_commit_conflict(&e) => {
                 if attempt == MAX_COMMIT_ATTEMPTS {
