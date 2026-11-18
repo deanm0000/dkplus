@@ -60,7 +60,8 @@ pub(crate) async fn run(
         TimeType::TimestampTz => time.with_timezone(&table.timezone).date_naive(),
         _ => time.date_naive(),
     };
-    let job = table
+    let repack_table = table.with_fallback_sort()?;
+    let job = repack_table
         .repack(
             date(start),
             date(last)
@@ -88,7 +89,7 @@ pub(crate) async fn run(
     job.validate_schema(&data_schema)?;
     let utc_col = meta
         .columns
-        .get(&table.time_column)
+        .get(table.validate_window()?)
         .context("missing time column")?;
     if types::arrow_type(&utc_col.ty)? != types::arrow_type(table.time_type.sql())? {
         fail!(InvalidInput, "window column type does not match table");
@@ -275,7 +276,7 @@ pub(super) async fn read_inlined(
         .map(|field| identifier(field.name()).map(|name| format!("{name}::text")))
         .collect::<Result<Vec<_>>>()?
         .join(", ");
-    let time = identifier(&table.time_column)?;
+    let time = identifier(table.validate_window()?)?;
     let ty = table.time_type.sql();
     let tables = client.query(
         "SELECT table_name FROM ducklake.ducklake_inlined_data_tables WHERE table_id = $1 ORDER BY table_name",

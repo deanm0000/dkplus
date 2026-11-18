@@ -273,14 +273,12 @@ impl Runs {
             .dedup_timestamp
             .clone()
             .expect("test table has a dedup timestamp");
-        runs.set_unique(unique, &timestamp);
+        runs.set_unique(unique, Some(&timestamp));
         runs
     }
 
-    pub(super) fn set_unique(&mut self, unique: &[String], timestamp: &str) {
-        self.ordering = unique.iter().map(|name| (name.clone(), false)).collect();
-        self.ordering.push((timestamp.into(), true));
-        self.ordering.push((ROW_ID.into(), true));
+    pub(super) fn set_unique(&mut self, unique: &[String], timestamp: Option<&str>) {
+        self.ordering = dedup_ordering(unique, timestamp);
     }
 
     pub(super) async fn push(&mut self, batch: RecordBatch, work: &mut Work) -> Result<()> {
@@ -474,15 +472,22 @@ pub(super) fn sort_batch(batch: &RecordBatch, ordering: &[(String, bool)]) -> Re
     )?)
 }
 
+fn dedup_ordering(unique: &[String], timestamp: Option<&str>) -> Vec<(String, bool)> {
+    let mut ordering: Vec<_> = unique.iter().map(|name| (name.clone(), false)).collect();
+    if let Some(timestamp) = timestamp {
+        ordering.push((timestamp.into(), true));
+    }
+    ordering.push((ROW_ID.into(), true));
+    ordering
+}
+
 pub(super) fn deduplicate_batch(
     batch: &RecordBatch,
     unique: &[String],
-    timestamp: &str,
+    timestamp: Option<&str>,
 ) -> Result<(RecordBatch, i64)> {
     let schema = batch.schema();
-    let mut ordering: Vec<_> = unique.iter().map(|name| (name.clone(), false)).collect();
-    ordering.push((timestamp.into(), true));
-    ordering.push((ROW_ID.into(), true));
+    let ordering = dedup_ordering(unique, timestamp);
     let sorted = sort_batch(batch, &ordering)?;
     let indices = unique
         .iter()
@@ -970,6 +975,71 @@ mod tests {
         assert_eq!(removed, 0);
         assert!(runs.finish(&mut work, false, &[]).await.unwrap().is_none());
         assert!(work.temps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deduplication_without_timestamp_works_in_batches_and_spilled_runs() {
+        let unique = vec!["node".into()];
+        let batch = RecordBatch::try_from_iter([
+            (
+                "node",
+                Arc::new(StringArray::from(vec![
+                    Some("B"),
+                    Some("A"),
+                    Some("B"),
+                    None,
+                    None,
+                ])) as ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])) as ArrayRef,
+            ),
+            (
+                ROW_ID,
+                Arc::new(Int64Array::from(vec![100, 101, 102, 103, 104])) as ArrayRef,
+            ),
+            (
+                SNAPSHOT_ID,
+                Arc::new(Int64Array::from(vec![42; 5])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let (deduped, removed) = deduplicate_batch(&batch, &unique, None).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(deduped.num_rows(), 3);
+        let expected = deduped
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+            .values()
+            .to_vec();
+        assert_eq!(expected, [101, 102, 104]);
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut work = Work::new(store.clone(), "table/".into());
+        let mut report = crate::test_support::table();
+        report.dedup_timestamp = None;
+        report.row_group_col = None;
+        report.sort_cols = vec!["node".into()];
+        let mut runs = Runs::for_report(report);
+        runs.set_unique(&unique, None);
+        for index in 0..batch.num_rows() {
+            runs.push(batch.slice(index, 1), &mut work).await.unwrap();
+            runs.flush(&mut work).await.unwrap();
+        }
+        let (mut output, removed) = runs.deduplicate(&mut work, &unique).await.unwrap();
+        assert_eq!(removed, 2);
+        let batches = output
+            .stream(&mut work)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&batch.schema(), &batches).unwrap();
+        assert_eq!(actual, deduped);
+        work.cleanup(&crate::test_support::table().cfg.log).await;
     }
 
     #[tokio::test]

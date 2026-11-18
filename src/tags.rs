@@ -13,21 +13,22 @@ fn normalize(settings: &BTreeMap<String, Value>) -> Result<HashMap<String, Strin
     for (name, value) in settings {
         let key = format!("dkplus.{}", name.strip_prefix("dkplus.").unwrap_or(name));
         match key.as_str() {
-            TAG_TIME_COLUMN | TAG_TIMEZONE => {
+            TAG_TIMEZONE => {
                 if !value.is_string() {
                     fail!(InvalidInput, "{name} must be a string");
                 }
             }
-            TAG_ROW_GROUP_COL | TAG_DEDUP_TIMESTAMP | TAG_GRANULARITY => {
+            TAG_TIME_COLUMN | TAG_ROW_GROUP_COL | TAG_DEDUP_TIMESTAMP | TAG_GRANULARITY => {
                 if !value.is_string() && !value.is_null() {
                     fail!(InvalidInput, "{name} must be a string or null");
                 }
             }
             TAG_SORT_COLS | TAG_UNIQUE_BY_COLS => {
-                if !(key == TAG_UNIQUE_BY_COLS && value.is_null()) {
+                if !value.is_null() {
                     let names: Vec<String> = serde_json::from_value(value.clone())
                         .with_context(|| format!("{name} must be an array of column names"))?;
-                    if names.is_empty() || names.iter().collect::<HashSet<_>>().len() != names.len()
+                    if (key == TAG_UNIQUE_BY_COLS && names.is_empty())
+                        || names.iter().collect::<HashSet<_>>().len() != names.len()
                     {
                         fail!(
                             InvalidInput,
@@ -63,7 +64,7 @@ async fn validate(
     meta: &TableMeta,
     tags: &HashMap<String, String>,
 ) -> Result<()> {
-    let time: Option<String> = tag_value(tags, TAG_TIME_COLUMN)?;
+    let time: Option<String> = tag_value::<Option<String>>(tags, TAG_TIME_COLUMN)?.flatten();
     let time_col = time
         .as_ref()
         .map(|name| {
@@ -89,18 +90,29 @@ async fn validate(
         };
     }
     if let Some(name) = time {
-        policy.time_column = name;
+        policy.time_column = Some(name);
     }
     policy.row_group_col = tag_value::<Option<String>>(tags, TAG_ROW_GROUP_COL)?.flatten();
     // Missing required settings are allowed here, but never persisted as defaults.
-    policy.sort_cols = tag_value(tags, TAG_SORT_COLS)?.unwrap_or_else(|| {
-        vec![
-            policy
-                .row_group_col
-                .clone()
-                .unwrap_or_else(|| policy.time_column.clone()),
-        ]
-    });
+    policy.sort_cols = tag_value::<Option<Vec<String>>>(tags, TAG_SORT_COLS)?
+        .flatten()
+        .unwrap_or_else(|| {
+            vec![
+                policy
+                    .row_group_col
+                    .clone()
+                    .unwrap_or_else(|| policy.time_column.clone().unwrap_or_else(|| "time".into())),
+            ]
+        });
+    if let Some(name) = &policy.row_group_col
+        && !policy.sort_cols.is_empty()
+        && policy.sort_cols.first() != Some(name)
+    {
+        fail!(
+            InvalidInput,
+            "row-group column must be the first sort column"
+        );
+    }
     policy.unique_by_cols = tag_value::<Option<Vec<String>>>(tags, TAG_UNIQUE_BY_COLS)?.flatten();
     policy.dedup_timestamp = tag_value::<Option<String>>(tags, TAG_DEDUP_TIMESTAMP)?.flatten();
     let mut names = Vec::new();
@@ -355,7 +367,7 @@ mod tests {
             serde_json::json!({"unknown": "x"}),
             serde_json::json!({"timezone": null}),
             serde_json::json!({"sort_cols": "a,b"}),
-            serde_json::json!({"sort_cols": []}),
+            serde_json::json!({"unique_by_cols": []}),
             serde_json::json!({"sort_cols": ["a", "a"]}),
             serde_json::json!({"time_column": "a", "dkplus.time_column": "b"}),
             serde_json::json!({"repack_level0_age_min": "1 day"}),
@@ -375,5 +387,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        for value in [
+            serde_json::json!({"time_column": null, "sort_cols": null}),
+            serde_json::json!({"sort_cols": []}),
+        ] {
+            normalize(&serde_json::from_value(value).unwrap()).unwrap();
+        }
     }
 }

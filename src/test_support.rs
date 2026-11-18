@@ -5,7 +5,7 @@ pub fn table() -> Table {
     Table {
         schema: "ciso".into(),
         table: "rtprices".into(),
-        time_column: "utcbegin".into(),
+        time_column: Some("utcbegin".into()),
         row_group_col: Some("node".into()),
         sort_cols: vec!["node".into(), "utcbegin".into()],
         unique_by_cols: None,

@@ -106,9 +106,10 @@ are `time_column`, `row_group_col`, `sort_cols`, `unique_by_cols`,
 settings documented below. Unknown keys are errors. File values use native JSON
 strings, arrays, or null, not strings containing JSON. On the command line, pass
 lists as JSON arrays, for example `'["node","utcbegin"]'`; scalar values are
-ordinary strings. `null` disables nullable settings (`row_group_col`,
-`unique_by_cols`, `dedup_timestamp`, `granularity`, and repack rules); it does not
-delete their tags. Other tags remain unchanged.
+ordinary strings. `null` disables nullable settings (`time_column`, `sort_cols`,
+`row_group_col`, `unique_by_cols`, `dedup_timestamp`, `granularity`, and repack
+rules); it does not delete their tags. An empty `sort_cols` array also disables
+sorting. Other tags remain unchanged.
 
 All settings, including `timezone` and `granularity`, are written as **table tags**
 in `ducklake_tag`, with `object_id` set to the table ID. They may be configured
@@ -124,9 +125,8 @@ and `relage_max`, which are signed to support future-dated records. Calendar
 units must match the documented choices. The resulting policy is checked for
 consistency, including sort/group ordering and deduplication dependencies.
 
-Partial configuration is allowed: missing required settings need not all be
-supplied in one command, but must be present before resolving a table for data
-operations. Every effective change across the entire invocation is committed
+Partial configuration is allowed: settings are required only by the operations
+that use them. Every effective change across the entire invocation is committed
 atomically in **one snapshot increment**. A validation failure changes nothing;
 an unchanged request does not allocate a snapshot. The command prints the
 resulting snapshot ID and exits nonzero on errors. `dkplus --help` shows usage.
@@ -142,6 +142,35 @@ settings and writes all of them to `ducklake_tag`.
 
 Callers own credential/environment parsing. Table policy can live in DuckLake
 tags and be overridden per operation:
+
+For a table without a time column, use `insert` to append batches. To replace
+existing rows by key instead, configure `unique_by_cols` and use `upsert`:
+
+```rust,no_run
+# use datafusion::arrow::array::RecordBatch;
+# async fn example(cfg: &dkplus::Config, batches: Vec<RecordBatch>) -> dkplus::Result<()> {
+let table = cfg.table("main.pairs").await?;
+table.insert(batches.clone()).await?;
+
+let keyed = cfg.table_builder("main.pairs")
+    .with_unique_by_cols(vec!["col1".into()])
+    .resolve().await?;
+keyed.upsert(batches).await?;
+# Ok(())
+# }
+```
+
+These operations do not require a time column, timezone, sort columns, or
+deduplication timestamp. Each call writes one Parquet data file in a new
+DuckLake snapshot. Upsert replaces all live rows matching an input key; null
+key components compare equal. Duplicate input keys, including duplicates
+across batches, are rejected.
+Existing nonmatching rows and prior positional deletes are preserved.
+Upsert scans all active data files, loading each file into memory along with
+the input keys and its delete positions. Concurrent catalog changes during the scan cause a
+`CatalogChanged` error; retry the operation against the latest snapshot. Both
+operations reject partitioned tables. Upsert also rejects mapped, encrypted,
+partial or non-Parquet files and source schemas it cannot reconcile by field ID.
 
 ```rust,no_run
 use std::sync::Arc;
@@ -264,20 +293,20 @@ async fn build() -> dkplus::Result<Table> {
 return the same builder, which retains a cloned config. Call `.resolve().await?`
 to resolve policy from explicit values and active DuckLake table tags.
 Use `cfg.table("schema.table").await?` to resolve using only DuckLake metadata,
-without any overrides. Explicit values override tags. Required
-settings left unresolved by both sources fail with an error.
+without any overrides. Explicit values override tags. Operations report an error
+when a setting they require is absent.
 Resolve a builder when starting an operation to pick up the latest committed
 tags. `with_*` values are per-table overrides and do not write tags back to
 DuckLake; use `Table::update_tags` to persist table-level changes.
 
 | Setting | Meaning |
 |---|---|
-| `time_column` | Required window column; its `date`, `timestamp`, or `timestamptz` type is inferred from the catalog. |
-| `timezone` | Target IANA zone, supplied explicitly or by the table's `dkplus.timezone` tag. Required even for naive/date tables, where boundaries remain wall-clock values. It is not inferable from `timestamptz`, which stores instants, not a named zone. |
+| `time_column` | Optional window column; required for window replacement and repacking. Its `date`, `timestamp`, or `timestamptz` type is inferred from the catalog. Use `without_time_column()` to override a tag. |
+| `timezone` | Target IANA zone, supplied explicitly or by the table's `dkplus.timezone` tag. Required by window operations, even for naive/date tables, where boundaries remain wall-clock values. It is not inferable from `timestamptz`, which stores instants, not a named zone. If absent during resolution, the public `Table::timezone` field contains a UTC placeholder; it does not enable window operations. Use the builder to configure a zone. |
 | `row_group_col` | Optional grouping column; must lead `sort_cols`. Missing/`null` means no row grouping. |
-| `sort_cols` | Required ascending sort order of repacked files. |
+| `sort_cols` | Optional ascending sort order, required for repacking. An empty list means no configured sort. If a window replacement or `merge_diff` needs to rewrite existing files, it uses the row-group column (if any) and time column as internal sort keys when none are configured. |
 | `unique_by_cols` | Optional columns defining duplicates; missing/`null` disables deduplication. |
-| `dedup_timestamp` | Optional microsecond timestamp used to choose the retained duplicate. Required when `unique_by_cols` is set. |
+| `dedup_timestamp` | Optional microsecond timestamp used to choose the newest duplicate during repacking. Without it, repacking retains an arbitrary row per key. Required only by `merge_diff`, not by upsert or ordinary deduplication. |
 | `granularity` | Spacing of time-column values (`with_granularity`), or `Granularity::Unpredictable`. Required only to find maintenance repacks. |
 | `repack_levels` | Maintenance repack levels (`with_repack_levels`); see [Maintenance repack levels](#maintenance-repack-levels). |
 | `lock_namespace` | Optional explicit lock namespace; defaults to the table name. |
@@ -291,12 +320,12 @@ The `key` identifies the setting, and `value` is a string containing JSON:
 
 | Tag key | JSON value example | How dkplus uses it |
 |---|---|---|
-| `dkplus.time_column` | `"observed"` | Required column defining repack windows. Its catalog type determines whether boundaries are dates or timestamps. |
+| `dkplus.time_column` | `"observed"` or `null` | Optional column defining windows. Its catalog type determines whether boundaries are dates or timestamps. |
 | `dkplus.timezone` | `"America/New_York"` | Target IANA time zone for repack boundaries. |
 | `dkplus.row_group_col` | `"station"` or `null` | Optional row-group key. When set, it must be the first column in `dkplus.sort_cols`. |
-| `dkplus.sort_cols` | `["station", "observed"]` | Required ascending sort order for repacked files. |
-| `dkplus.unique_by_cols` | `["station", "observed"]` or `null` | Optional duplicate key. When set, dkplus keeps the row selected using `dkplus.dedup_timestamp`. |
-| `dkplus.dedup_timestamp` | `"fetched_at"` or `null` | Optional microsecond timestamp column used to select a retained row for each duplicate key. Required when `unique_by_cols` is set. |
+| `dkplus.sort_cols` | `["station", "observed"]`, `[]` or `null` | Ascending sort order for repacked files; missing or empty disables configured sorting. |
+| `dkplus.unique_by_cols` | `["station", "observed"]` or `null` | Optional duplicate key for upsert, deduplicating repacks and `merge_diff`. Deduplicating repacks keep the newest timestamp when configured, otherwise an arbitrary row. |
+| `dkplus.dedup_timestamp` | `"fetched_at"` or `null` | Optional microsecond timestamp used to select the newest row for deduplicating repacks; required for `merge_diff` history semantics. Missing/`null` allows ordinary deduplication with an arbitrary survivor. |
 | `dkplus.granularity` | `"5 minutes"`, `"unpredictable"` or `null` | Spacing of time values as a Postgres interval. Used by `find_potential_repacks`. |
 | `dkplus.repack_level<N>_<rule>` | `"1 day"`, `"month"` or `null` | Maintenance repack level rules; see below. |
 

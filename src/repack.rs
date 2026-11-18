@@ -219,7 +219,7 @@ fn deserialize_table<'de, D: serde::Deserializer<'de>>(
         schema: schema.into(),
         table: table.into(),
         // Queued jobs must be supplied a resolved table before running.
-        time_column: String::new(),
+        time_column: None,
         ..Table::default()
     })
 }
@@ -228,6 +228,7 @@ impl Table {
     /// Build a job between table-timezone midnights using table deduplication
     /// policy, no file guard, and `IfNoDedup`.
     pub fn repack(&self, begin_date: NaiveDate, end_date: NaiveDate) -> Result<Job> {
+        self.validate_repack()?;
         Ok(self.repack_between(
             Bound::for_table(self, self.midnight(begin_date)?),
             Bound::for_table(self, self.midnight(end_date)?),
@@ -285,6 +286,7 @@ impl Job {
 
     pub fn validate(&self) -> Result<()> {
         self.table.validate()?;
+        self.table.validate_repack()?;
         if [&self.table.schema, &self.table.table].iter().any(|part| {
             part.is_empty() || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         }) {
@@ -303,12 +305,6 @@ impl Job {
                     fail!(InvalidInput, "unique columns must be nonempty and distinct");
                 }
             }
-        }
-        if self.effective_unique().is_some() && self.table.dedup_timestamp.is_none() {
-            fail!(
-                InvalidInput,
-                "deduplication requires a dedup timestamp column"
-            );
         }
         self.begin.validate(&self.table, "begin")?;
         self.end.validate(&self.table, "end")?;
@@ -329,17 +325,12 @@ impl Job {
                     .index_of(name)
                     .with_context(|| format!("unknown unique column {name:?}"))?;
             }
-            if !matches!(
-                schema
-                    .field_with_name(
-                        self.table
-                            .dedup_timestamp
-                            .as_deref()
-                            .context("deduplication requires a dedup timestamp column")?,
-                    )?
-                    .data_type(),
-                DataType::Timestamp(TimeUnit::Microsecond, _)
-            ) {
+            if let Some(timestamp) = self.table.dedup_timestamp.as_deref()
+                && !matches!(
+                    schema.field_with_name(timestamp)?.data_type(),
+                    DataType::Timestamp(TimeUnit::Microsecond, _)
+                )
+            {
                 fail!(
                     InvalidInput,
                     "deduplication requires a microsecond timestamp column {:?}",
@@ -755,7 +746,7 @@ fn normalize(
 }
 
 fn split_in_window(batch: &RecordBatch, table: &Table, window: Window) -> Result<[RecordBatch; 3]> {
-    let column = batch.column(batch.schema().index_of(&table.time_column)?);
+    let column = batch.column(batch.schema().index_of(table.validate_window()?)?);
     if column.null_count() != 0 {
         fail!(
             InvalidData,
@@ -1513,14 +1504,8 @@ async fn align_cursors_with_window(
             .map(|(_, batch)| batch.num_rows() as i64)
             .sum::<i64>();
         if !discard_inside && let Some(unique) = job.effective_unique() {
-            let (deduplicated, count) = sort::deduplicate_batch(
-                &regions[1],
-                unique,
-                job.table
-                    .dedup_timestamp
-                    .as_deref()
-                    .context("deduplication requires a dedup timestamp column")?,
-            )?;
+            let (deduplicated, count) =
+                sort::deduplicate_batch(&regions[1], unique, job.table.dedup_timestamp.as_deref())?;
             removed += count;
             regions[1] = deduplicated;
         }
@@ -1703,13 +1688,7 @@ async fn prepare(context: PrepareContext<'_>) -> Result<Vec<FileInfo>> {
     }
     let mut runs: [_; 3] = std::array::from_fn(|_| sort::Runs::for_report(job.report().clone()));
     if let Some(unique) = job.effective_unique() {
-        runs[1].set_unique(
-            unique,
-            job.table
-                .dedup_timestamp
-                .as_deref()
-                .context("deduplication requires a dedup timestamp column")?,
-        );
+        runs[1].set_unique(unique, job.table.dedup_timestamp.as_deref());
     }
     let mut live_rows = 0i64;
     let mut discarded_rows = 0i64;
@@ -1999,10 +1978,10 @@ async fn retire_inlined_rows(
                         AND {}::{} >= $2::text::{}
                         AND {}::{} < $3::text::{}",
                     identifier(&name)?,
-                    identifier(&table.time_column)?,
+                    identifier(table.validate_window()?)?,
                     table.time_type.sql(),
                     table.time_type.sql(),
-                    identifier(&table.time_column)?,
+                    identifier(table.validate_window()?)?,
                     table.time_type.sql(),
                     table.time_type.sql()
                 ),
@@ -2562,12 +2541,13 @@ async fn run(job: &Job) -> Result<()> {
         );
         return Ok(());
     }
+    let time_column = job.table.validate_window()?;
     let utc_col = meta
         .columns
-        .get(&job.table.time_column)
+        .get(time_column)
         .context("table has no configured window column")?
         .id;
-    if types::arrow_type(&meta.columns[&job.table.time_column].ty)?
+    if types::arrow_type(&meta.columns[time_column].ty)?
         != types::arrow_type(job.table.time_type.sql())?
     {
         fail!(InvalidInput, "window column type does not match table");
@@ -2721,7 +2701,7 @@ mod tests {
             let mut job = test_job(None);
             job.table.time_type = kind;
             job.table.timezone = chrono_tz::UTC;
-            job.table.time_column = "observed".into();
+            job.table.time_column = Some("observed".into());
             set_dates(&mut job, "2026-01-02", "2026-01-03");
             let column: ArrayRef = if kind == TimeType::Date {
                 Arc::new(Date32Array::from(vec![20454, 20455, 20456]))
@@ -2759,7 +2739,7 @@ mod tests {
         use datafusion::arrow::array::TimestampMicrosecondArray;
         let mut table = test_job(None).table;
         table.time_type = TimeType::Timestamp;
-        table.time_column = "observed".into();
+        table.time_column = Some("observed".into());
         let column = Arc::new(TimestampMicrosecondArray::from(vec![100, 200, 300]));
         let schema = Arc::new(Schema::new(vec![Field::new(
             "observed",
@@ -3656,121 +3636,126 @@ mod tests {
 
     #[tokio::test]
     async fn aligned_repack_deduplicates_compatible_unique_keys_by_latest_row() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let meta = TableMeta {
-            table_id: 1,
-            root: String::new(),
-            columns: HashMap::from([
-                (
-                    "node".into(),
-                    Column {
-                        id: 11,
-                        ty: "varchar".into(),
-                    },
-                ),
-                (
-                    "utcbegin".into(),
-                    Column {
-                        id: 22,
-                        ty: "timestamptz".into(),
-                    },
-                ),
-                (
-                    "downloaded_at".into(),
-                    Column {
-                        id: 33,
-                        ty: "timestamptz".into(),
-                    },
-                ),
-            ]),
-        };
-        let data_schema = schema(&meta).unwrap();
-        let target = with_identity(&data_schema);
-        let cols = resolve_columns(&meta, &data_schema).unwrap();
-        let job = test_job(Some(vec!["node".into(), "utcbegin".into()]));
-        let start = job.start().unwrap().timestamp_micros();
-        let path = ObjPath::from("unique-source.parquet");
-        let properties = WriterProperties::builder()
-            .set_statistics_enabled(EnabledStatistics::Chunk)
-            .set_statistics_truncate_length(None)
-            .build();
-        let mut writer = AsyncArrowWriter::try_new(
-            BufWriter::new(store.clone(), path.clone()),
-            data_schema.clone(),
-            Some(properties),
-        )
-        .unwrap();
-        let batch = RecordBatch::try_new(
-            data_schema,
-            vec![
-                Arc::new(StringArray::from(vec!["A", "A", "A", "B"])),
-                Arc::new(
-                    TimestampMicrosecondArray::from(vec![
-                        start + 1_000_000,
-                        start + 1_000_000,
-                        start + 1_000_000,
-                        start + 2_000_000,
-                    ])
-                    .with_timezone("UTC"),
-                ),
-                Arc::new(
-                    TimestampMicrosecondArray::from(vec![
-                        start + 1_000_000,
-                        start + 3_000_000,
-                        start + 3_000_000,
-                        start + 2_000_000,
-                    ])
-                    .with_timezone("UTC"),
-                ),
-            ],
-        )
-        .unwrap();
-        writer.write(&batch).await.unwrap();
-        writer.close().await.unwrap();
-        let source = test_source(1, "unique-source.parquet", 4, 100);
-        let cursor = fast_cursor(store.clone(), "unique-source.parquet", source).await;
-        let mut work = Work::with_limits(
-            store.clone(),
-            "table/".into(),
-            crate::config::DEFAULT_REPACK_RUN_BYTES,
-            crate::config::DEFAULT_REPACK_NODE_BYTES,
-        );
-        let (files, live_rows, removed) = align_cursors(
-            vec![cursor],
-            &job,
-            &mut work,
-            &target,
-            &cols,
-            "node",
-            &job.table.cfg.log,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!((live_rows, removed), (4, 2));
-        assert_eq!(files[0].rows, 2);
-        let bytes = store
-            .get(&ObjPath::from(format!("table/{}", files[0].name)))
+        for with_timestamp in [true, false] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let meta = TableMeta {
+                table_id: 1,
+                root: String::new(),
+                columns: HashMap::from([
+                    (
+                        "node".into(),
+                        Column {
+                            id: 11,
+                            ty: "varchar".into(),
+                        },
+                    ),
+                    (
+                        "utcbegin".into(),
+                        Column {
+                            id: 22,
+                            ty: "timestamptz".into(),
+                        },
+                    ),
+                    (
+                        "downloaded_at".into(),
+                        Column {
+                            id: 33,
+                            ty: "timestamptz".into(),
+                        },
+                    ),
+                ]),
+            };
+            let data_schema = schema(&meta).unwrap();
+            let target = with_identity(&data_schema);
+            let cols = resolve_columns(&meta, &data_schema).unwrap();
+            let mut job = test_job(Some(vec!["node".into(), "utcbegin".into()]));
+            if !with_timestamp {
+                job.table.dedup_timestamp = None;
+            }
+            let start = job.start().unwrap().timestamp_micros();
+            let path = ObjPath::from("unique-source.parquet");
+            let properties = WriterProperties::builder()
+                .set_statistics_enabled(EnabledStatistics::Chunk)
+                .set_statistics_truncate_length(None)
+                .build();
+            let mut writer = AsyncArrowWriter::try_new(
+                BufWriter::new(store.clone(), path.clone()),
+                data_schema.clone(),
+                Some(properties),
+            )
+            .unwrap();
+            let batch = RecordBatch::try_new(
+                data_schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["A", "A", "A", "B"])),
+                    Arc::new(
+                        TimestampMicrosecondArray::from(vec![
+                            start + 1_000_000,
+                            start + 1_000_000,
+                            start + 1_000_000,
+                            start + 2_000_000,
+                        ])
+                        .with_timezone("UTC"),
+                    ),
+                    Arc::new(
+                        TimestampMicrosecondArray::from(vec![
+                            start + 1_000_000,
+                            start + 3_000_000,
+                            start + 3_000_000,
+                            start + 2_000_000,
+                        ])
+                        .with_timezone("UTC"),
+                    ),
+                ],
+            )
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+            writer.close().await.unwrap();
+            let source = test_source(1, "unique-source.parquet", 4, 100);
+            let cursor = fast_cursor(store.clone(), "unique-source.parquet", source).await;
+            let mut work = Work::with_limits(
+                store.clone(),
+                "table/".into(),
+                crate::config::DEFAULT_REPACK_RUN_BYTES,
+                crate::config::DEFAULT_REPACK_NODE_BYTES,
+            );
+            let (files, live_rows, removed) = align_cursors(
+                vec![cursor],
+                &job,
+                &mut work,
+                &target,
+                &cols,
+                "node",
+                &job.table.cfg.log,
+            )
             .await
             .unwrap()
-            .bytes()
-            .await
             .unwrap();
-        let batches = ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .unwrap()
-            .build()
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
-        let output = concat_batches(&target, &batches).unwrap();
-        assert_eq!(
-            output
-                .column(target.index_of(ROW_ID).unwrap())
-                .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
-                .values()
-                .as_ref(),
-            [102, 103]
-        );
+            assert_eq!((live_rows, removed), (4, 2));
+            assert_eq!(files[0].rows, 2);
+            let bytes = store
+                .get(&ObjPath::from(format!("table/{}", files[0].name)))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let batches = ParquetRecordBatchReaderBuilder::try_new(bytes)
+                .unwrap()
+                .build()
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            let output = concat_batches(&target, &batches).unwrap();
+            assert_eq!(
+                output
+                    .column(target.index_of(ROW_ID).unwrap())
+                    .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+                    .values()
+                    .as_ref(),
+                [102, 103]
+            );
+        }
     }
 
     #[tokio::test]
@@ -4193,7 +4178,7 @@ mod tests {
         }
         let mut payload = base;
         payload["unique"] = serde_json::json!(["node"]);
-        let job: Job = crate::test_support::job_from_value(payload).unwrap();
+        let mut job: Job = crate::test_support::job_from_value(payload).unwrap();
         let no_download = Arc::new(Schema::new(
             schema
                 .fields()
@@ -4208,6 +4193,9 @@ mod tests {
             Field::new("downloaded_at", DataType::Utf8, true),
         ]));
         assert!(job.validate_schema(&wrong_download).is_err());
+        job.table.dedup_timestamp = None;
+        job.validate().unwrap();
+        job.validate_schema(&no_download).unwrap();
     }
 
     #[test]

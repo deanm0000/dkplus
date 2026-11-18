@@ -61,11 +61,12 @@ fn column_time_type(ty: &str) -> Result<TimeType> {
 
 /// Reads current files' time and dedup-timestamp statistics; no data files are read.
 async fn load_files(client: &impl GenericClient, table: &Table) -> Result<Vec<plan::FileStat>> {
+    let time_column = table.validate_window()?;
     let meta = table_meta(client, &table.schema, &table.table).await?;
     let time = meta
         .columns
-        .get(&table.time_column)
-        .with_context(|| format!("{table} has no column {}", table.time_column))?;
+        .get(time_column)
+        .with_context(|| format!("{table} has no column {time_column}"))?;
     let dedup = match &table.dedup_timestamp {
         Some(name) => {
             let column = meta
@@ -106,7 +107,7 @@ async fn load_files(client: &impl GenericClient, table: &Table) -> Result<Vec<pl
                 fail!(
                     InvalidData,
                     "{table}: file {path} has missing or null {} statistics",
-                    table.time_column
+                    time_column
                 );
             };
             Ok(plan::FileStat {
@@ -151,6 +152,7 @@ pub async fn find_potential_repacks(
     if table.repack_levels.is_empty() {
         return Ok(Vec::new());
     }
+    table.validate_repack()?;
     let granularity = table
         .granularity
         .ok_or_else(|| Error::MissingRequiredSetting {

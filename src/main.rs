@@ -47,7 +47,7 @@ fn parse(args: &[String]) -> Result<(&str, Input)> {
                 operation: format!("{name} requires a JSON array or null"),
                 source,
             })?
-        } else if pair[1] == "null" && name != "time_column" && name != "timezone" {
+        } else if pair[1] == "null" && name != "timezone" {
             Value::Null
         } else {
             Value::String(pair[1].clone())

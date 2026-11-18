@@ -32,6 +32,7 @@ pub mod parquet;
 pub mod repack;
 pub mod tags;
 mod types;
+mod write;
 
 const MAX_COMMIT_ATTEMPTS: u32 = 6;
 
@@ -44,6 +45,7 @@ pub struct LoadReport {
     pub file_size_bytes: i64,
     /// Files retired via `end_snapshot`.
     pub retired_files: Vec<i64>,
+    /// Rows in retired files for window writes, or matching rows deleted by upsert.
     pub retired_rows: i64,
     /// Retired files rewritten to retain their rows outside the replacement window.
     pub rewritten_files: Vec<i64>,
@@ -150,10 +152,10 @@ async fn has_inlined_rows(
                     "SELECT EXISTS (SELECT 1 FROM ducklake.\"{}\" WHERE end_snapshot IS NULL
                        AND {}::{} >= $1::text::{} AND {}::{} < $2::text::{})",
                     name.replace('"', "\"\""),
-                    identifier(&table.time_column)?,
+                    identifier(table.validate_window()?)?,
                     table.time_type.sql(),
                     table.time_type.sql(),
-                    identifier(&table.time_column)?,
+                    identifier(table.validate_window()?)?,
                     table.time_type.sql(),
                     table.time_type.sql()
                 ),
@@ -499,37 +501,22 @@ fn resolve_table_settings_inner(
     tags: &HashMap<String, String>,
     intervals: &HashMap<String, maintenance::Interval>,
 ) -> Result<Table> {
-    let name = format!("{}.{}", builder.schema, builder.table);
-    let time_column =
-        overridden_tag(builder.time_column, tags, TAG_TIME_COLUMN)?.ok_or_else(|| {
-            Error::MissingRequiredSetting {
-                table: name.clone(),
-                setting: "time_column",
-            }
-        })?;
-    let time_col = meta
-        .columns
-        .get(&time_column)
-        .with_context(|| format!("table has no configured time column {time_column:?}"))?;
+    let time_column = overridden_tag(builder.time_column, tags, TAG_TIME_COLUMN)?.flatten();
     let timezone = match builder.timezone {
-        Some(timezone) => timezone,
+        Some(timezone) => Some(timezone),
         None => tag_value::<String>(tags, TAG_TIMEZONE)?
             .map(|zone| {
                 zone.parse::<chrono_tz::Tz>()
                     .with_context(|| format!("invalid timezone tag {zone:?}"))
             })
-            .transpose()?
-            .ok_or_else(|| Error::MissingRequiredSetting {
-                table: name.clone(),
-                setting: "timezone",
-            })?,
+            .transpose()?,
     };
-    let sort_cols = overridden_tag(builder.sort_cols, tags, TAG_SORT_COLS)?.ok_or_else(|| {
-        Error::MissingRequiredSetting {
-            table: name,
-            setting: "sort_cols",
-        }
-    })?;
+    let sort_cols = match builder.sort_cols {
+        Some(cols) => cols,
+        None => tag_value::<Option<Vec<String>>>(tags, TAG_SORT_COLS)?
+            .flatten()
+            .unwrap_or_default(),
+    };
     let row_group_col =
         overridden_tag(builder.row_group_col, tags, TAG_ROW_GROUP_COL)?.unwrap_or(None);
     let unique_by_cols =
@@ -549,16 +536,22 @@ fn resolve_table_settings_inner(
         None => resolve_levels(tags, intervals)?,
     };
     repack_levels.sort_by_key(|level| level.level);
-    let time_type = match types::arrow_type(&time_col.ty)? {
-        DataType::Date32 => TimeType::Date,
-        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => TimeType::TimestampTz,
-        DataType::Timestamp(TimeUnit::Microsecond, None) => TimeType::Timestamp,
-        _ => {
-            fail!(
+    let time_type = if let Some(name) = &time_column {
+        let time_col = meta
+            .columns
+            .get(name)
+            .with_context(|| format!("table has no configured time column {name:?}"))?;
+        match types::arrow_type(&time_col.ty)? {
+            DataType::Date32 => TimeType::Date,
+            DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => TimeType::TimestampTz,
+            DataType::Timestamp(TimeUnit::Microsecond, None) => TimeType::Timestamp,
+            _ => fail!(
                 InvalidInput,
-                "configured time column {time_column:?} must be a date or microsecond timestamp"
-            )
+                "configured time column {name:?} must be a date or microsecond timestamp"
+            ),
         }
+    } else {
+        TimeType::TimestampTz
     };
     let table = Table {
         cfg: builder.cfg,
@@ -566,7 +559,8 @@ fn resolve_table_settings_inner(
         table: builder.table.clone(),
         time_column,
         time_type,
-        timezone,
+        timezone: timezone.unwrap_or(chrono_tz::UTC),
+        timezone_configured: timezone.is_some(),
         row_group_col,
         sort_cols,
         unique_by_cols,
@@ -577,7 +571,10 @@ fn resolve_table_settings_inner(
         lock_namespace: builder.lock_namespace.unwrap_or(builder.table),
     };
     table.validate()?;
-    for name in std::iter::once(table.time_column.as_str())
+    for name in table
+        .time_column
+        .as_deref()
+        .into_iter()
         .chain(table.row_group_col.as_deref())
         .chain(table.sort_cols.iter().map(String::as_str))
         .chain(
@@ -623,7 +620,11 @@ fn arrow_type_matches(catalog_ty: &str, dt: &DataType) -> bool {
 /// Catalog columns for each batch field, in batch order. Every catalog column must be present.
 fn resolve_columns<'a>(meta: &'a TableMeta, schema: &Schema) -> Result<Vec<&'a Column>> {
     let mut out = Vec::with_capacity(schema.fields().len());
+    let mut names = std::collections::HashSet::new();
     for f in schema.fields() {
+        if !names.insert(f.name()) {
+            fail!(InvalidInput, "duplicate batch column {:?}", f.name());
+        }
         let col = meta
             .columns
             .get(f.name())
@@ -1110,13 +1111,14 @@ impl Table {
         &self,
         batches: &[RecordBatch],
     ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+        let time_column = self.validate_window()?;
         let mut minimum = None::<i64>;
         let mut maximum = None::<i64>;
         for batch in batches {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let column = batch.column(batch.schema().index_of(&self.time_column)?);
+            let column = batch.column(batch.schema().index_of(time_column)?);
             if column.null_count() != 0 {
                 fail!(
                     InvalidInput,
@@ -1330,6 +1332,7 @@ impl Table {
         let table = self;
         let cfg = &self.cfg;
         self.validate()?;
+        self.validate_window()?;
         let batches: Vec<_> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
         let (start, end) = self.replacement_bounds(&batches)?;
         for batch in &batches {
@@ -1351,7 +1354,7 @@ impl Table {
         let cols = resolve_columns(&meta, &batches[0].schema())?;
         let utc_col = meta
             .columns
-            .get(&table.time_column)
+            .get(table.validate_window()?)
             .context("table has no configured window column")?;
         if types::arrow_type(&utc_col.ty)? != types::arrow_type(table.time_type.sql())? {
             fail!(InvalidInput, "window column type does not match table");
@@ -1376,19 +1379,30 @@ impl Table {
             .put(&obj, PutPayload::from(Bytes::from(buf)))
             .await
             .with_context(|| format!("uploading {}{}", meta.root, file.name))?;
+        let mut fallback_table = table.with_fallback_sort()?;
+        fallback_table.unique_by_cols = None;
         let result = if let Some(scope) = &partition {
             repack::replace_window(
                 &mut client,
                 &meta,
                 utc_col.id,
-                table,
+                &fallback_table,
                 repack::Window { start, end },
                 &file,
                 Some(scope),
             )
             .await
         } else {
-            register(&mut client, table, &meta, utc_col.id, start, end, &file).await
+            register(
+                &mut client,
+                &fallback_table,
+                &meta,
+                utc_col.id,
+                start,
+                end,
+                &file,
+            )
+            .await
         };
         if result.is_err()
             && let Err(e) = store.delete(&obj).await
@@ -1459,7 +1473,7 @@ mod tests {
                 Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC"))
             }
         };
-        RecordBatch::try_from_iter([(table.time_column.as_str(), column)]).unwrap()
+        RecordBatch::try_from_iter([(table.time_column.as_deref().unwrap(), column)]).unwrap()
     }
 
     #[test]
@@ -1506,7 +1520,8 @@ mod tests {
         let column =
             Arc::new(TimestampMicrosecondArray::from(vec![Some(1), None]).with_timezone("UTC"))
                 as ArrayRef;
-        let batch = RecordBatch::try_from_iter([(table.time_column.as_str(), column)]).unwrap();
+        let batch =
+            RecordBatch::try_from_iter([(table.time_column.as_deref().unwrap(), column)]).unwrap();
         assert!(
             table
                 .replace_window(vec![batch])
@@ -1545,7 +1560,7 @@ mod tests {
                 .is_err()
         );
         let mut other = table.clone();
-        other.time_column = "other".into();
+        other.time_column = Some("other".into());
         assert!(
             table
                 .replace_window(vec![replacement_batch(&other, vec![1])])
@@ -1554,7 +1569,10 @@ mod tests {
         );
         let first = replacement_batch(&table, vec![1]);
         let extra = RecordBatch::try_from_iter([
-            (table.time_column.as_str(), first.column(0).clone()),
+            (
+                table.time_column.as_deref().unwrap(),
+                first.column(0).clone(),
+            ),
             ("extra", first.column(0).clone()),
         ])
         .unwrap();
@@ -1629,7 +1647,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(table.time_type, TimeType::Date);
-        assert_eq!(table.time_column, "observed");
+        assert_eq!(table.time_column.as_deref(), Some("observed"));
         assert_eq!(table.timezone, chrono_tz::UTC);
         assert_eq!(table.row_group_col.as_deref(), Some("station"));
         assert_eq!(table.sort_cols, ["station", "observed"]);
@@ -1682,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_table_tags_fail() {
+    fn optional_table_settings_are_required_by_their_features() {
         let meta = TableMeta {
             table_id: 1,
             root: String::new(),
@@ -1695,25 +1713,99 @@ mod tests {
             )]),
         };
         let mut tags = HashMap::new();
-        for (setting, key, value) in [
-            ("time_column", TAG_TIME_COLUMN, r#""observed""#),
-            ("timezone", TAG_TIMEZONE, r#""UTC""#),
-            ("sort_cols", TAG_SORT_COLS, r#"["observed"]"#),
-        ] {
-            let error = resolve_table_settings(
+        let resolve = |tags: &HashMap<String, String>| {
+            resolve_table_settings(
                 Table::builder("weather.observations", &Table::default().cfg),
                 &meta,
-                &tags,
+                tags,
                 &HashMap::new(),
             )
-            .unwrap_err();
-            assert!(
-                matches!(&error, Error::MissingRequiredSetting { table, setting: missing }
-                if table == "weather.observations" && *missing == setting),
-                "{error:?}"
-            );
-            tags.insert(key.into(), value.into());
-        }
+            .unwrap()
+        };
+        let table = resolve(&tags);
+        assert_eq!(table.time_column, None);
+        assert!(table.sort_cols.is_empty());
+        assert!(matches!(
+            table.validate_window(),
+            Err(Error::MissingRequiredSetting {
+                setting: "time_column",
+                ..
+            })
+        ));
+        let key_only = resolve_table_settings(
+            Table::builder("weather.observations", &Table::default().cfg)
+                .with_row_group_col("observed")
+                .with_unique_by_cols(vec!["observed".into()]),
+            &meta,
+            &tags,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(key_only.unique_by_cols, Some(vec!["observed".into()]));
+        assert_eq!(key_only.dedup_timestamp, None);
+        assert!(key_only.validate().is_ok());
+        tags.insert(TAG_TIME_COLUMN.into(), r#""observed""#.into());
+        assert!(matches!(
+            resolve(&tags).validate_window(),
+            Err(Error::MissingRequiredSetting {
+                setting: "timezone",
+                ..
+            })
+        ));
+        tags.insert(TAG_TIMEZONE.into(), r#""UTC""#.into());
+        assert!(matches!(
+            resolve(&tags).validate_repack(),
+            Err(Error::MissingRequiredSetting {
+                setting: "sort_cols",
+                ..
+            })
+        ));
+        tags.insert(TAG_SORT_COLS.into(), r#"["observed"]"#.into());
+        assert!(resolve(&tags).validate_repack().is_ok());
+        let overridden = resolve_table_settings(
+            Table::builder("weather.observations", &Table::default().cfg)
+                .without_time_column()
+                .with_sort_cols(vec![]),
+            &meta,
+            &tags,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(overridden.time_column, None);
+        assert!(overridden.sort_cols.is_empty());
+        tags.insert(TAG_TIME_COLUMN.into(), "null".into());
+        tags.insert(TAG_SORT_COLS.into(), "null".into());
+        assert_eq!(resolve(&tags).time_column, None);
+        assert!(resolve(&tags).sort_cols.is_empty());
+    }
+
+    #[test]
+    fn duplicate_batch_columns_cannot_replace_missing_catalog_columns() {
+        let meta = TableMeta {
+            table_id: 1,
+            root: String::new(),
+            columns: HashMap::from([
+                (
+                    "col1".into(),
+                    Column {
+                        id: 1,
+                        ty: "varchar".into(),
+                    },
+                ),
+                (
+                    "col2".into(),
+                    Column {
+                        id: 2,
+                        ty: "varchar".into(),
+                    },
+                ),
+            ]),
+        };
+        let schema = Schema::new(vec![
+            Field::new("col1", DataType::Utf8, true),
+            Field::new("col1", DataType::Utf8, true),
+        ]);
+        assert!(resolve_columns(&meta, &schema).is_err());
     }
 
     #[test]

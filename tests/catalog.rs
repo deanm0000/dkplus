@@ -32,7 +32,8 @@ CREATE TABLE ducklake.ducklake_data_file (
     encryption_key text, mapping_id bigint, partial_max bigint);
 CREATE TABLE ducklake.ducklake_delete_file (
     delete_file_id bigint, table_id bigint, data_file_id bigint, begin_snapshot bigint, end_snapshot bigint,
-    path text, path_is_relative bool, delete_count bigint, format text, encryption_key text, partial_max bigint);
+    path text, path_is_relative bool, delete_count bigint, format text, encryption_key text, partial_max bigint,
+    file_size_bytes bigint, footer_size bigint);
 CREATE TABLE ducklake.ducklake_file_column_stats (
     data_file_id bigint, table_id bigint, column_id bigint, column_size_bytes bigint,
     value_count bigint, null_count bigint, min_value text, max_value text, contains_nan bool, extra_stats text);
@@ -160,7 +161,7 @@ async fn typed_errors_preserve_catalog_sources_and_retry_exhaustion() {
     let error = dkplus::tags::update(
         &postgres,
         serde_json::from_value(serde_json::json!({
-            "weather.observations": { "sort_cols": [] }
+            "weather.observations": { "sort_cols": ["observed"] }
         }))
         .unwrap(),
     )
@@ -334,9 +335,10 @@ async fn table_timezone_resolves_from_active_metadata_and_ignores_column_tags() 
         )
         .await
         .unwrap();
+    let without_timezone = cfg.table("weather.observations").await.unwrap();
     assert!(
-        cfg.table("weather.observations")
-            .await
+        without_timezone
+            .repack("2026-01-01".parse().unwrap(), "2026-02-01".parse().unwrap())
             .unwrap_err()
             .to_string()
             .contains("timezone")
@@ -368,10 +370,309 @@ async fn table_timezone_resolves_from_active_metadata_and_ignores_column_tags() 
 
 #[tokio::test]
 #[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+async fn non_window_insert_and_upsert_preserve_live_rows_and_identities() {
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    client.batch_execute(CATALOG).await.unwrap();
+    client
+        .batch_execute(
+            "INSERT INTO ducklake.ducklake_metadata VALUES ('data_path','memory:///',NULL);
+             INSERT INTO ducklake.ducklake_table VALUES (1,1,'pairs','pairs/',true,NULL);
+             INSERT INTO ducklake.ducklake_column VALUES
+                 (1,1,'col1','varchar',NULL,NULL), (1,2,'col2','varchar',NULL,NULL);",
+        )
+        .await
+        .unwrap();
+    let store = Arc::new(InMemory::new());
+    let cfg = Config {
+        postgres,
+        storage: Storage::Store {
+            root: "memory:///".into(),
+            store: store.clone(),
+        },
+        ..Table::default().cfg
+    };
+    let batch = |keys: Vec<Option<&str>>, values: Vec<&str>| {
+        RecordBatch::try_from_iter([
+            ("col1", Arc::new(StringArray::from(keys)) as ArrayRef),
+            ("col2", Arc::new(StringArray::from(values)) as ArrayRef),
+        ])
+        .unwrap()
+    };
+    let unconfigured = cfg.table("weather.pairs").await.unwrap();
+    assert_eq!(unconfigured.time_column, None);
+    assert!(unconfigured.sort_cols.is_empty());
+    assert!(
+        unconfigured
+            .upsert(vec![batch(vec![Some("a")], vec!["x"])])
+            .await
+            .is_err()
+    );
+    let first = unconfigured
+        .insert(vec![batch(
+            vec![Some("a"), Some("a"), Some("b"), Some("c"), None],
+            vec!["old1", "old2", "deleted", "keep-c", "null-key"],
+        )])
+        .await
+        .unwrap();
+    let second = unconfigured
+        .insert(vec![batch(
+            vec![Some("d"), Some("a")],
+            vec!["keep-d", "old3"],
+        )])
+        .await
+        .unwrap();
+    let original_ids = client.query(
+            "SELECT data_file_id, row_id_start FROM ducklake.ducklake_data_file WHERE end_snapshot IS NULL ORDER BY data_file_id",
+            &[],
+        ).await.unwrap().into_iter()
+            .map(|r| (r.get::<_, i64>(0), r.get::<_, i64>(1)))
+            .collect::<Vec<_>>();
+    let deleted =
+        RecordBatch::try_from_iter([("pos", Arc::new(Int64Array::from(vec![2])) as ArrayRef)])
+            .unwrap();
+    let mut writer = dkplus::parquet::ParquetWriter::new(
+        store.clone(),
+        "weather/pairs/old-delete.parquet".into(),
+        deleted.schema(),
+        dkplus::parquet::Grouping::None,
+    )
+    .unwrap();
+    writer.write(&deleted).await.unwrap();
+    writer.finish().await.unwrap();
+    client.execute(
+            "INSERT INTO ducklake.ducklake_delete_file
+             (delete_file_id,table_id,data_file_id,begin_snapshot,end_snapshot,path,path_is_relative,delete_count,format)
+             VALUES (100,1,$1,$2,NULL,'old-delete.parquet',true,1,'parquet')",
+            &[&first.data_file_id, &second.snapshot_id],
+        ).await.unwrap();
+    client.batch_execute(
+            "UPDATE ducklake.ducklake_snapshot SET next_file_id=101 WHERE snapshot_id=(SELECT max(snapshot_id) FROM ducklake.ducklake_snapshot);
+             UPDATE ducklake.ducklake_table_stats SET record_count=record_count-1 WHERE table_id=1;
+             CREATE TABLE ducklake.inline_pairs (col1 text, col2 text, end_snapshot bigint);
+             INSERT INTO ducklake.inline_pairs VALUES ('a','inline-old',NULL),('e','inline-keep',NULL);
+             INSERT INTO ducklake.ducklake_inlined_data_tables VALUES (1,'inline_pairs');
+             UPDATE ducklake.ducklake_table_stats SET record_count=record_count+2 WHERE table_id=1;"
+        ).await.unwrap();
+    dkplus::tags::update(
+        &cfg.postgres,
+        serde_json::from_value(serde_json::json!({
+            "weather.pairs": { "unique_by_cols": ["col1"] }
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let table = cfg.table("weather.pairs").await.unwrap();
+    assert_eq!(table.dedup_timestamp, None);
+    assert!(
+        table
+            .upsert(vec![batch(vec![Some("a"), Some("a")], vec!["x", "y"])])
+            .await
+            .is_err()
+    );
+    assert!(
+        table
+            .upsert(vec![
+                batch(vec![Some("a")], vec!["x"]),
+                batch(vec![Some("a")], vec!["y"])
+            ])
+            .await
+            .is_err()
+    );
+    assert!(
+        table
+            .upsert(vec![batch(vec![None, None], vec!["x", "y"])])
+            .await
+            .is_err()
+    );
+    let result = table
+        .upsert(vec![batch(
+            vec![Some("a"), Some("f"), None],
+            vec!["new-a", "new-f", "new-null"],
+        )])
+        .await
+        .unwrap();
+    let remaining_ids = client
+        .query(
+            "SELECT data_file_id, row_id_start FROM ducklake.ducklake_data_file
+             WHERE end_snapshot IS NULL AND data_file_id = ANY($1) ORDER BY data_file_id",
+            &[&vec![first.data_file_id, second.data_file_id]],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.get::<_, i64>(0), r.get::<_, i64>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(remaining_ids, original_ids);
+    let mut live = Vec::new();
+    for row in client.query(
+            "SELECT f.path, d.path FROM ducklake.ducklake_data_file f
+             LEFT JOIN ducklake.ducklake_delete_file d ON d.data_file_id=f.data_file_id AND d.end_snapshot IS NULL
+             WHERE f.table_id=1 AND f.end_snapshot IS NULL", &[],
+        ).await.unwrap() {
+            let path: String = row.get(0);
+            let delete_path: Option<String> = row.get(1);
+            let mut positions = std::collections::HashSet::new();
+            if let Some(path) = delete_path {
+                let data = store.get(&format!("weather/pairs/{path}").into()).await.unwrap().bytes().await.unwrap();
+                for batch in ParquetRecordBatchReaderBuilder::try_new(data).unwrap().build().unwrap() {
+                    let batch = batch.unwrap();
+                    let pos = batch.column_by_name("pos").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+                    positions.extend(pos.values().iter().copied());
+                }
+            }
+            let data = store.get(&format!("weather/pairs/{path}").into()).await.unwrap().bytes().await.unwrap();
+            let mut offset = 0i64;
+            for batch in ParquetRecordBatchReaderBuilder::try_new(data).unwrap().build().unwrap() {
+                let batch = batch.unwrap();
+                let keys = batch.column_by_name("col1").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+                let values = batch.column_by_name("col2").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+                for i in 0..batch.num_rows() {
+                    if !positions.contains(&(offset + i as i64)) {
+                        live.push(((!keys.is_null(i)).then(|| keys.value(i).to_owned()), values.value(i).to_owned()));
+                    }
+                }
+                offset += batch.num_rows() as i64;
+            }
+        }
+    for row in client
+        .query(
+            "SELECT col1,col2 FROM ducklake.inline_pairs WHERE end_snapshot IS NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+    {
+        live.push((row.get(0), row.get(1)));
+    }
+    live.sort();
+    let mut expected = vec![
+        (None, "new-null".to_owned()),
+        (Some("a".to_owned()), "new-a".to_owned()),
+        (Some("c".to_owned()), "keep-c".to_owned()),
+        (Some("d".to_owned()), "keep-d".to_owned()),
+        (Some("e".to_owned()), "inline-keep".to_owned()),
+        (Some("f".to_owned()), "new-f".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(live, expected);
+    assert_eq!(
+        count(
+            &client,
+            "SELECT record_count FROM ducklake.ducklake_table_stats WHERE table_id=1"
+        )
+        .await,
+        6
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.inline_pairs WHERE end_snapshot IS NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &client,
+            &format!(
+                "SELECT count(*) FROM ducklake.inline_pairs WHERE col1='a' AND end_snapshot={}",
+                result.snapshot_id
+            )
+        )
+        .await,
+        1
+    );
+    assert_eq!(count(&client, "SELECT count(*) FROM ducklake.ducklake_delete_file WHERE delete_file_id=100 AND end_snapshot IS NOT NULL").await, 1);
+    let before_paths = store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .len();
+    let (mut blocker, blocker_connection) =
+        cfg.postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let blocker_connection = tokio::spawn(async move { blocker_connection.await.unwrap() });
+    let tx = blocker.transaction().await.unwrap();
+    tx.batch_execute("LOCK TABLE ducklake.ducklake_snapshot IN SHARE ROW EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let concurrent_table = table.clone();
+    let pending = tokio::spawn(async move {
+        concurrent_table
+            .upsert(vec![batch(vec![Some("a")], vec!["conflict"])])
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if store
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .len()
+                > before_paths
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO ducklake.ducklake_snapshot
+         SELECT snapshot_id + 1, now(), schema_version, next_catalog_id, next_file_id
+           FROM ducklake.ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1",
+        &[],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let error = pending.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, dkplus::Error::CatalogChanged { .. }),
+        "{error}"
+    );
+    assert_eq!(
+        store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len(),
+        before_paths
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT record_count FROM ducklake.ducklake_table_stats WHERE table_id=1"
+        )
+        .await,
+        6
+    );
+    drop(blocker);
+    blocker_connection.await.unwrap();
+    client
+        .batch_execute("DROP SCHEMA ducklake CASCADE")
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
 async fn merge_diff_publishes_both_tables_atomically_and_preserves_unmatched_rows() {
     use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use futures::TryStreamExt;
-
     let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
         .unwrap()
         .parse()
@@ -404,7 +705,6 @@ async fn merge_diff_publishes_both_tables_atomically_and_preserves_unmatched_row
         .table_builder("weather.entries")
         .with_time_column("observed")
         .with_timezone(chrono_tz::UTC)
-        .with_sort_cols(vec!["node".into(), "observed".into()])
         .with_unique_by_cols(vec!["node".into(), "observed".into()])
         .with_dedup_timestamp("fetched")
         .resolve()
@@ -1163,7 +1463,11 @@ async fn replacement_rewrites_straddling_files_and_versions_inlined_rows() {
         )
         .await
         .unwrap();
-    let replacement = table
+    let mut unsorted = table.clone();
+    unsorted.sort_cols.clear();
+    unsorted.unique_by_cols = Some(vec!["station".into()]);
+    unsorted.dedup_timestamp = None;
+    let replacement = unsorted
         .replace_window(vec![batch("2026-01-02")])
         .await
         .unwrap();

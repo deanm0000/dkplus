@@ -170,12 +170,18 @@ pub struct Table {
     pub cfg: Config,
     pub schema: String,
     pub table: String,
-    pub time_column: String,
+    pub time_column: Option<String>,
     pub(crate) time_type: TimeType,
+    /// Window timezone. If no timezone was configured at resolution, this
+    /// contains UTC as a placeholder and window operations report an error.
+    /// Configure an explicit timezone with [`TableBuilder::with_timezone`].
     pub timezone: Tz,
+    pub(crate) timezone_configured: bool,
     pub row_group_col: Option<String>,
     pub sort_cols: Vec<String>,
     pub unique_by_cols: Option<Vec<String>>,
+    /// Prefer the newest duplicate when configured; otherwise keep an arbitrary row.
+    /// Required by `merge_diff`, but optional for ordinary deduplication.
     pub dedup_timestamp: Option<String>,
     /// Spacing of time-column values; required to find maintenance repacks.
     pub granularity: Option<Granularity>,
@@ -202,9 +208,10 @@ impl Default for Table {
             },
             schema: "main".into(),
             table: String::new(),
-            time_column: "time".into(),
+            time_column: Some("time".into()),
             time_type: TimeType::TimestampTz,
             timezone: chrono_tz::UTC,
+            timezone_configured: true,
             row_group_col: None,
             sort_cols: vec!["time".into()],
             unique_by_cols: None,
@@ -229,7 +236,7 @@ pub struct TableBuilder {
     pub(crate) cfg: Config,
     pub(crate) schema: String,
     pub(crate) table: String,
-    pub(crate) time_column: Option<String>,
+    pub(crate) time_column: Option<Option<String>>,
     pub(crate) timezone: Option<Tz>,
     pub(crate) row_group_col: Option<Option<String>>,
     pub(crate) sort_cols: Option<Vec<String>>,
@@ -269,10 +276,16 @@ impl TableBuilder {
     }
 
     pub fn with_time_column(mut self, name: impl Into<String>) -> Self {
-        self.time_column = Some(name.into());
+        self.time_column = Some(Some(name.into()));
         self
     }
 
+    pub fn without_time_column(mut self) -> Self {
+        self.time_column = Some(None);
+        self
+    }
+
+    /// The zone is needed by window operations, not by insert or upsert.
     pub fn with_timezone(mut self, timezone: Tz) -> Self {
         self.timezone = Some(timezone);
         self
@@ -344,21 +357,18 @@ impl Table {
     fn validate_settings(&self) -> Result<()> {
         identifier(&self.schema)?;
         identifier(&self.table)?;
-        identifier(&self.time_column)?;
-        if self.sort_cols.is_empty() {
-            fail!(InvalidInput, "sort columns must not be empty");
+        if let Some(name) = &self.time_column {
+            identifier(name)?;
         }
+        let mut sort_seen = std::collections::HashSet::new();
         for name in &self.sort_cols {
             identifier(name)?;
+            if !sort_seen.insert(name) {
+                fail!(InvalidInput, "sort columns must be distinct");
+            }
         }
         if let Some(name) = &self.row_group_col {
             identifier(name)?;
-            if self.sort_cols.first() != Some(name) {
-                fail!(
-                    InvalidInput,
-                    "row-group column must be the first sort column"
-                );
-            }
         }
         if let Some(unique) = &self.unique_by_cols {
             if unique.is_empty() {
@@ -370,12 +380,6 @@ impl Table {
                 if !seen.insert(name) {
                     fail!(InvalidInput, "unique columns must be distinct");
                 }
-            }
-            if self.dedup_timestamp.is_none() {
-                fail!(
-                    InvalidInput,
-                    "deduplication requires a dedup timestamp column"
-                );
             }
         }
         if let Some(name) = &self.dedup_timestamp {
@@ -411,6 +415,59 @@ impl Table {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn window_column(&self) -> Result<&str> {
+        self.time_column
+            .as_deref()
+            .ok_or_else(|| crate::Error::MissingRequiredSetting {
+                table: self.to_string(),
+                setting: "time_column",
+            })
+    }
+
+    pub(crate) fn validate_window(&self) -> Result<&str> {
+        let column = self.window_column()?;
+        if !self.timezone_configured {
+            return Err(crate::Error::MissingRequiredSetting {
+                table: self.to_string(),
+                setting: "timezone",
+            });
+        }
+        Ok(column)
+    }
+
+    pub(crate) fn validate_repack(&self) -> Result<()> {
+        self.validate_window()?;
+        if self.sort_cols.is_empty() {
+            return Err(crate::Error::MissingRequiredSetting {
+                table: self.to_string(),
+                setting: "sort_cols",
+            });
+        }
+        if let Some(name) = &self.row_group_col
+            && self.sort_cols.first() != Some(name)
+        {
+            fail!(
+                InvalidInput,
+                "row-group column must be the first sort column"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_fallback_sort(&self) -> Result<Self> {
+        let mut table = self.clone();
+        if table.sort_cols.is_empty() {
+            if let Some(name) = &table.row_group_col {
+                table.sort_cols.push(name.clone());
+            }
+            let time = self.window_column()?;
+            if !table.sort_cols.iter().any(|name| name == time) {
+                table.sort_cols.push(time.to_owned());
+            }
+        }
+        Ok(table)
     }
 
     pub(crate) fn author_for(
