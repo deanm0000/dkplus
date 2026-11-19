@@ -769,33 +769,103 @@ enum Attempt {
     NeedsRewrite,
 }
 
-async fn try_register(
+struct ReplacementScan {
+    snapshot: i64,
+    retire: Vec<i64>,
+    retired_rows: i64,
+}
+
+fn changes_only_other_tables(changes: &str, table_id: i64) -> bool {
+    changes.split(',').all(|change| {
+        let Some((kind, id)) = change.split_once(':') else {
+            return false;
+        };
+        matches!(
+            kind,
+            "inserted_into_table"
+                | "deleted_from_table"
+                | "altered_table"
+                | "dropped_table"
+                | "compacted_table"
+                | "merge_adjacent"
+                | "rewrite_delete"
+                | "inlined_insert"
+                | "inlined_delete"
+                | "flushed_inlined"
+                | "inline_flush"
+        ) && !id.is_empty()
+            && id.bytes().all(|byte| byte.is_ascii_digit())
+            && id.parse::<i64>().is_ok_and(|id| id != table_id)
+    })
+}
+
+async fn validate_replacement_scan(
+    tx: &impl GenericClient,
+    table_id: i64,
+    scanned: i64,
+    latest: i64,
+) -> Result<()> {
+    if latest < scanned {
+        fail!(CatalogChanged, "DuckLake snapshot moved backwards");
+    }
+    if scanned == latest {
+        return Ok(());
+    }
+    // Read the change log directly: expired snapshots can still have change records.
+    let rows = tx
+        .query(
+            "SELECT snapshot_id, changes_made FROM ducklake.ducklake_snapshot_changes
+              WHERE snapshot_id > $1 AND snapshot_id <= $2 ORDER BY snapshot_id",
+            &[&scanned, &latest],
+        )
+        .await
+        .context("reading intervening DuckLake changes")?;
+    let mut previous = scanned;
+    for row in rows {
+        let snapshot: i64 = row.get(0);
+        let changes: Option<&str> = row.get(1);
+        if previous.checked_add(1) != Some(snapshot)
+            || !changes.is_some_and(|changes| changes_only_other_tables(changes, table_id))
+        {
+            fail!(
+                CatalogChanged,
+                "cannot reuse replacement scan for table {table_id} at snapshot {snapshot}"
+            );
+        }
+        previous = snapshot;
+    }
+    if previous != latest {
+        fail!(
+            CatalogChanged,
+            "missing DuckLake changes through snapshot {latest}"
+        );
+    }
+    Ok(())
+}
+
+async fn scan_replacement(
     client: &mut Client,
     table: &Table,
     meta: &TableMeta,
     utc_col: i64,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-    file: &FileInfo,
-) -> Result<Attempt> {
+) -> Result<Option<ReplacementScan>> {
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
         .start()
         .await?;
-    lock_catalog_write(&tx).await?;
     let table_id = meta.table_id;
-
-    let snap = tx
+    let snapshot = tx
         .query_one(
-            "SELECT snapshot_id, schema_version, next_catalog_id, next_file_id
-               FROM ducklake.ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1",
+            "SELECT snapshot_id FROM ducklake.ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1",
             &[],
         )
         .await
-        .context("reading latest snapshot")?;
-    let (prev_snap, schema_version, next_catalog_id, next_file_id): (i64, i64, i64, i64) =
-        (snap.get(0), snap.get(1), snap.get(2), snap.get(3));
+        .context("reading replacement scan snapshot")?
+        .get(0);
 
     let existing = tx
         .query(
@@ -825,12 +895,63 @@ async fn try_register(
                 retired_rows += r.get::<_, Option<i64>>(1).unwrap_or(0);
             }
             // Straddles the window (e.g. after compaction) or has no stats.
-            _ => return Ok(Attempt::NeedsRewrite),
+            _ => {
+                tx.commit().await?;
+                return Ok(None);
+            }
         }
     }
 
-    if has_inlined_rows(&tx, table_id, table, start, end).await? {
+    let inline = has_inlined_rows(&tx, table_id, table, start, end).await?;
+    tx.commit().await.context("finishing replacement scan")?;
+    Ok((!inline).then_some(ReplacementScan {
+        snapshot,
+        retire,
+        retired_rows,
+    }))
+}
+
+async fn try_register(
+    client: &mut Client,
+    table: &Table,
+    meta: &TableMeta,
+    utc_col: i64,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    file: &FileInfo,
+) -> Result<Attempt> {
+    let Some(ReplacementScan {
+        snapshot,
+        retire,
+        retired_rows,
+    }) = scan_replacement(client, table, meta, utc_col, start, end).await?
+    else {
         return Ok(Attempt::NeedsRewrite);
+    };
+
+    let tx = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .start()
+        .await?;
+    lock_catalog_write(&tx).await?;
+    let table_id = meta.table_id;
+    let snap = tx
+        .query_one(
+            "SELECT snapshot_id, schema_version, next_catalog_id, next_file_id
+               FROM ducklake.ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1",
+            &[],
+        )
+        .await
+        .context("reading latest snapshot")?;
+    let (prev_snap, schema_version, next_catalog_id, next_file_id): (i64, i64, i64, i64) =
+        (snap.get(0), snap.get(1), snap.get(2), snap.get(3));
+    validate_replacement_scan(&tx, table_id, snapshot, prev_snap).await?;
+    if table_meta(&tx, &table.schema, &table.table).await? != *meta {
+        fail!(
+            CatalogChanged,
+            "table metadata changed while preparing replacement"
+        );
     }
 
     let snapshot_id = prev_snap + 1;
@@ -1504,7 +1625,7 @@ async fn register(
                 return repack::replace_window(client, meta, utc_col, table, window, file, None)
                     .await;
             }
-            Err(e) if is_commit_conflict(&e) => {
+            Err(e) if is_commit_conflict(&e) || matches!(e, Error::CatalogChanged { .. }) => {
                 if attempt == MAX_COMMIT_ATTEMPTS {
                     return Err(Error::CommitRetriesExhausted {
                         attempts: attempt,
@@ -1527,6 +1648,51 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use datafusion::arrow::array::{ArrayRef, Date32Array, TimestampMicrosecondArray};
+
+    #[tokio::test]
+    #[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+    async fn replacement_scan_reuses_only_complete_other_table_changes() {
+        let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (mut client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+        let connection = tokio::spawn(connection);
+        let tx = client.transaction().await.unwrap();
+        tx.batch_execute(
+            "CREATE SCHEMA ducklake;
+             CREATE TABLE ducklake.ducklake_snapshot_changes (
+                 snapshot_id bigint, changes_made text);
+             INSERT INTO ducklake.ducklake_snapshot_changes VALUES
+                 (11, 'inserted_into_table:12,deleted_from_table:12'),
+                 (12, 'inlined_insert:12'),
+                 (13, 'inline_flush:2'),
+                 (14, 'created_schema:\"new\"'),
+                 (16, 'compacted_table:12'),
+                 (17, NULL),
+                 (18, 'inserted_into_table:12'),
+                 (18, 'inlined_insert:2');",
+        )
+        .await
+        .unwrap();
+        validate_replacement_scan(&tx, 2, 10, 12).await.unwrap();
+        for (scanned, latest) in [
+            (12, 13), // same-table inline flush
+            (13, 14), // not a table-scoped change
+            (14, 16), // missing intermediate record
+            (16, 17), // null change record
+            (17, 18), // ambiguous duplicate record
+            (18, 19), // missing latest record
+        ] {
+            assert!(matches!(
+                validate_replacement_scan(&tx, 2, scanned, latest).await,
+                Err(Error::CatalogChanged { .. })
+            ));
+        }
+        tx.rollback().await.unwrap();
+        drop(client);
+        connection.await.unwrap().unwrap();
+    }
 
     fn replacement_batch(table: &Table, values: Vec<i64>) -> RecordBatch {
         let column: ArrayRef = match table.time_type {

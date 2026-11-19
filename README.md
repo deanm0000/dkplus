@@ -490,6 +490,13 @@ window). Commit conflicts are retried automatically. Use Arrow `Date32` for date
 or microsecond timestamps (timezone-aware for `timestamptz`, naive for `timestamp`),
 matching the resolved table's time column.
 
+The direct replacement path scans for overlapping files and inline rows in a
+read-only transaction before acquiring the catalog write lock. While publishing,
+it reuses that scan across known changes to other tables. A change to the target
+table or an incomplete or unrecognized change log causes a retry outside the write
+lock. Replacements that need to rewrite existing files retain their separate
+source revalidation at publish time.
+
 #### Merge updates and retain changed versions
 
 `Table::merge_diff(batches, "entries_diff")` infers the same window, but merges

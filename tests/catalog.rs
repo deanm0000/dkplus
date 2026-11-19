@@ -1359,7 +1359,10 @@ async fn concurrent_replacements_serialize_snapshot_publication() {
         .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
         .num_days() as i32;
     let batch = RecordBatch::try_from_iter([
-        ("observed", Arc::new(Date32Array::from(vec![day])) as ArrayRef),
+        (
+            "observed",
+            Arc::new(Date32Array::from(vec![day])) as ArrayRef,
+        ),
         ("station", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
         (
             "fetched",
