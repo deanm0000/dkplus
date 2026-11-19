@@ -1336,6 +1336,229 @@ async fn table_tag_updates_are_versioned_together_in_one_snapshot() {
 
 #[tokio::test]
 #[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+async fn concurrent_replacements_serialize_snapshot_publication() {
+    use dkplus::repack::Bound;
+    let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    let (_, job, _) = expiry_fixture(&client, &postgres).await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION ducklake.slow_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN PERFORM pg_sleep(0.025); RETURN NEW; END $$;
+             CREATE TRIGGER slow_snapshot BEFORE INSERT ON ducklake.ducklake_snapshot
+             FOR EACH ROW EXECUTE FUNCTION ducklake.slow_snapshot();",
+        )
+        .await
+        .unwrap();
+    let date: NaiveDate = "2026-01-01".parse().unwrap();
+    let day = date
+        .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+        .num_days() as i32;
+    let batch = RecordBatch::try_from_iter([
+        ("observed", Arc::new(Date32Array::from(vec![day])) as ArrayRef),
+        ("station", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+        (
+            "fetched",
+            Arc::new(TimestampMicrosecondArray::from(vec![1])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let empty = RecordBatch::new_empty(batch.schema());
+    let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = tokio::task::JoinSet::new();
+    for id in 2_i64..=9 {
+        let name = format!("observations_{id}");
+        client
+            .execute(
+                "INSERT INTO ducklake.ducklake_table VALUES ($1,1,$2,$2,true,NULL)",
+                &[&id, &name],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO ducklake.ducklake_column
+                 SELECT $1,column_id,column_name,column_type,parent_column,end_snapshot
+                 FROM ducklake.ducklake_column WHERE table_id=1",
+                &[&id],
+            )
+            .await
+            .unwrap();
+        let mut table = job.table.clone();
+        table.table = name;
+        let captured = messages.clone();
+        table.cfg.log = Arc::new(move |message| {
+            captured.lock().unwrap().push(message.to_owned());
+        });
+        let barrier = barrier.clone();
+        let batches = [batch.clone(), empty.clone(), empty.clone()];
+        tasks.spawn(async move {
+            barrier.wait().await;
+            let mut snapshots = Vec::new();
+            for batch in batches {
+                let report = table
+                    .replace_between(
+                        Bound::Naive(date.and_hms_opt(0, 0, 0).unwrap()),
+                        Bound::Naive(date.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap()),
+                        vec![batch],
+                    )
+                    .await
+                    .unwrap();
+                snapshots.push(report.snapshot_id);
+            }
+            snapshots
+        });
+    }
+    let mut snapshots = std::collections::BTreeSet::new();
+    while let Some(result) = tasks.join_next().await {
+        for snapshot in result.unwrap() {
+            assert!(snapshots.insert(snapshot));
+        }
+    }
+    assert_eq!(snapshots.len(), 24);
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.ducklake_data_file
+             WHERE table_id >= 2 AND end_snapshot IS NULL AND record_count > 0"
+        )
+        .await,
+        0
+    );
+    assert!(
+        !messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message.contains("commit conflict"))
+    );
+    client
+        .batch_execute("DROP SCHEMA ducklake CASCADE")
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+async fn explicit_replacement_clears_empty_windows_and_preserves_neighbors() {
+    use dkplus::repack::Bound;
+    let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    let (_, job, initial) = expiry_fixture(&client, &postgres).await;
+    let table = job.table;
+    let empty = RecordBatch::new_empty(Arc::new(Schema::new(vec![
+        Field::new(
+            "observed",
+            datafusion::arrow::datatypes::DataType::Date32,
+            false,
+        ),
+        Field::new(
+            "station",
+            datafusion::arrow::datatypes::DataType::Int32,
+            false,
+        ),
+        Field::new(
+            "fetched",
+            datafusion::arrow::datatypes::DataType::Timestamp(
+                datafusion::arrow::datatypes::TimeUnit::Microsecond,
+                None,
+            ),
+            false,
+        ),
+    ])));
+    let bound = |day: &str| {
+        Bound::Naive(
+            day.parse::<NaiveDate>()
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+        )
+    };
+    let neighboring_day = "2026-01-02"
+        .parse::<NaiveDate>()
+        .unwrap()
+        .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+        .num_days();
+    let neighbor = table
+        .replace_window(vec![
+            RecordBatch::try_new(
+                empty.schema(),
+                vec![
+                    Arc::new(Date32Array::from(vec![
+                        i32::try_from(neighboring_day).unwrap(),
+                    ])),
+                    Arc::new(Int32Array::from(vec![1])),
+                    Arc::new(TimestampMicrosecondArray::from(vec![1])),
+                ],
+            )
+            .unwrap(),
+        ])
+        .await
+        .unwrap();
+    assert!(neighbor.retired_files.is_empty());
+    assert_eq!(
+        count(
+            &client,
+            "SELECT record_count FROM ducklake.ducklake_table_stats WHERE table_id=1"
+        )
+        .await,
+        4
+    );
+    let cleared = table
+        .replace_between(
+            bound("2026-01-01"),
+            bound("2026-01-02"),
+            vec![empty.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.retired_files, vec![initial.data_file_id]);
+    assert_eq!(cleared.retired_rows, 3);
+    assert_eq!(
+        count(
+            &client,
+            "SELECT record_count FROM ducklake.ducklake_table_stats WHERE table_id=1"
+        )
+        .await,
+        1
+    );
+    table
+        .replace_between(bound("2026-01-01"), bound("2026-01-02"), vec![empty])
+        .await
+        .unwrap();
+    assert_eq!(
+        count(
+            &client,
+            "SELECT record_count FROM ducklake.ducklake_table_stats WHERE table_id=1"
+        )
+        .await,
+        1
+    );
+    assert_eq!(count(&client, &format!(
+        "SELECT count(*) FROM ducklake.ducklake_data_file WHERE data_file_id={} AND end_snapshot IS NULL",
+        neighbor.data_file_id
+    )).await, 1);
+    client
+        .batch_execute("DROP SCHEMA ducklake CASCADE")
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
 async fn inferred_replacement_retires_inclusive_bounds_and_gaps() {
     let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
         .unwrap()

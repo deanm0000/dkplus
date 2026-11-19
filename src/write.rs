@@ -884,9 +884,7 @@ async fn commit_insert(
     file: &FileInfo,
 ) -> Result<LoadReport> {
     let tx = client.transaction().await?;
-    tx.batch_execute("LOCK TABLE ducklake.ducklake_snapshot IN SHARE ROW EXCLUSIVE MODE")
-        .await
-        .context("locking DuckLake snapshots for insert")?;
+    lock_catalog_write(&tx).await?;
     let meta = table_meta(&tx, &table.schema, &table.table).await?;
     if &meta != expected_meta {
         fail!(CatalogChanged, "table metadata changed while writing");
@@ -958,9 +956,7 @@ async fn commit_upsert(
     data_file: &FileInfo,
 ) -> Result<LoadReport> {
     let tx = client.transaction().await?;
-    tx.batch_execute("LOCK TABLE ducklake.ducklake_snapshot IN SHARE ROW EXCLUSIVE MODE")
-        .await
-        .context("locking DuckLake snapshots for upsert")?;
+    lock_catalog_write(&tx).await?;
     let meta = table_meta(&tx, &table.schema, &table.table).await?;
     if &meta != expected_meta {
         fail!(CatalogChanged, "table metadata changed while upserting");

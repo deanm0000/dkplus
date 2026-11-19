@@ -222,9 +222,7 @@ pub async fn update(postgres: &tokio_postgres::Config, updates: Updates) -> Resu
     }
     let mut client = connect_catalog(postgres, Arc::new(|message| eprintln!("{message}"))).await?;
     let tx = client.transaction().await?;
-    tx.batch_execute("LOCK TABLE ducklake.ducklake_snapshot IN SHARE ROW EXCLUSIVE MODE")
-        .await
-        .context("locking snapshots for policy update")?;
+    crate::lock_catalog_write(&tx).await?;
     let latest = tx
         .query_one(
             "SELECT snapshot_id, schema_version, next_catalog_id, next_file_id

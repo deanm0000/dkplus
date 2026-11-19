@@ -3,20 +3,6 @@ use crate::Result;
 use crate::error::{Context, fail};
 use tokio_postgres::Transaction;
 
-pub(super) async fn lock(tx: &Transaction<'_>) -> Result<()> {
-    // Match cleanup's queue-first order. Acquire these before the first MVCC
-    // read so publication/expiry checks see a consistent, writable catalog.
-    tx.batch_execute(
-        "LOCK TABLE ducklake.ducklake_files_scheduled_for_deletion IN SHARE ROW EXCLUSIVE MODE;
-         LOCK TABLE ducklake.ducklake_data_file, ducklake.ducklake_delete_file,
-                    ducklake.ducklake_snapshot IN SHARE ROW EXCLUSIVE MODE;
-         LOCK TABLE ducklake.ducklake_table, ducklake.ducklake_schema,
-                    ducklake.ducklake_metadata IN SHARE MODE;",
-    )
-    .await
-    .context("locking catalog for repack snapshot expiry")
-}
-
 /// Expire the requested snapshots. Collect only this repack's obsolete
 /// files; unrelated obsolete catalog objects can be reclaimed by native expiry.
 pub(super) async fn snapshots(

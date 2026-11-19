@@ -36,6 +36,19 @@ mod write;
 
 const MAX_COMMIT_ATTEMPTS: u32 = 6;
 
+async fn lock_catalog_write(tx: &tokio_postgres::Transaction<'_>) -> Result<()> {
+    // Match cleanup's queue-first order, before the first MVCC read.
+    tx.batch_execute(
+        "LOCK TABLE ducklake.ducklake_files_scheduled_for_deletion IN SHARE ROW EXCLUSIVE MODE;
+         LOCK TABLE ducklake.ducklake_data_file, ducklake.ducklake_delete_file,
+                    ducklake.ducklake_snapshot IN SHARE ROW EXCLUSIVE MODE;
+         LOCK TABLE ducklake.ducklake_table, ducklake.ducklake_schema,
+                    ducklake.ducklake_metadata IN SHARE MODE;",
+    )
+    .await
+    .context("locking catalog for snapshot publication")
+}
+
 #[derive(Debug)]
 pub struct LoadReport {
     pub snapshot_id: i64,
@@ -770,6 +783,7 @@ async fn try_register(
         .isolation_level(IsolationLevel::RepeatableRead)
         .start()
         .await?;
+    lock_catalog_write(&tx).await?;
     let table_id = meta.table_id;
 
     let snap = tx
@@ -1182,9 +1196,7 @@ impl Table {
         }
         let mut client = connect(&self.cfg).await?;
         let tx = client.transaction().await?;
-        tx.batch_execute("LOCK TABLE ducklake.ducklake_snapshot IN SHARE ROW EXCLUSIVE MODE")
-            .await
-            .context("locking catalog snapshots for tag update")?;
+        lock_catalog_write(&tx).await?;
 
         let meta = table_meta(&tx, &self.schema, &self.table).await?;
         let latest = tx
@@ -1305,7 +1317,22 @@ impl Table {
     /// Replace the range from the minimum through maximum input time, inclusive.
     /// The half-open upper bound is one day (date) or microsecond (timestamp) later.
     pub async fn replace_window(&self, batches: Vec<RecordBatch>) -> Result<LoadReport> {
-        self.replace_window_inner(batches, None).await
+        self.replace_window_inner(batches, None, None).await
+    }
+
+    /// Replace an explicit half-open time window, including gaps and empty input.
+    /// Supply at least one typed batch, even when it contains zero rows.
+    /// All input times must lie within `[begin, end)`.
+    pub async fn replace_between(
+        &self,
+        begin: repack::Bound,
+        end: repack::Bound,
+        batches: Vec<RecordBatch>,
+    ) -> Result<LoadReport> {
+        let job = self.repack_between(begin, end);
+        job.validate()?;
+        self.replace_window_inner(batches, None, Some((begin.utc(), end.utc())))
+            .await
     }
 
     /// Replace an inferred time window in one identity VARCHAR partition.
@@ -1320,7 +1347,7 @@ impl Table {
         partition_value: &str,
     ) -> Result<LoadReport> {
         identifier(partition_column)?;
-        self.replace_window_inner(batches, Some((partition_column, partition_value)))
+        self.replace_window_inner(batches, Some((partition_column, partition_value)), None)
             .await
     }
 
@@ -1328,13 +1355,17 @@ impl Table {
         &self,
         batches: Vec<RecordBatch>,
         partition: Option<(&str, &str)>,
+        bounds: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> Result<LoadReport> {
         let table = self;
         let cfg = &self.cfg;
         self.validate()?;
         self.validate_window()?;
-        let batches: Vec<_> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
-        let (start, end) = self.replacement_bounds(&batches)?;
+        let batches: Vec<_> = batches
+            .into_iter()
+            .filter(|b| bounds.is_some() || b.num_rows() > 0)
+            .collect();
+        let (start, end) = self.explicit_or_inferred_bounds(&batches, bounds)?;
         for batch in &batches {
             if batch.schema() != batches[0].schema() {
                 fail!(InvalidInput, "load batch schemas differ");
@@ -1416,6 +1447,43 @@ impl Table {
             ));
         }
         result
+    }
+
+    fn explicit_or_inferred_bounds(
+        &self,
+        batches: &[RecordBatch],
+        bounds: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+        let Some((start, end)) = bounds else {
+            return self.replacement_bounds(batches);
+        };
+        if start >= end {
+            fail!(InvalidInput, "replacement begin must precede end");
+        }
+        if batches.is_empty() {
+            fail!(InvalidInput, "explicit replacement needs a typed batch");
+        }
+        let column = self.validate_window()?;
+        for batch in batches {
+            let schema = batch.schema();
+            let field = schema.field_with_name(column)?;
+            if !types::matches(self.time_type.sql(), field.data_type()) {
+                fail!(
+                    InvalidInput,
+                    "replacement time column type does not match table"
+                );
+            }
+        }
+        if batches.iter().any(|batch| batch.num_rows() > 0) {
+            let (lo, hi) = self.replacement_bounds(batches)?;
+            if lo < start || hi > end {
+                fail!(
+                    InvalidInput,
+                    "input times lie outside the replacement window"
+                );
+            }
+        }
+        Ok((start, end))
     }
 }
 
@@ -1502,6 +1570,56 @@ mod tests {
                 .unwrap();
             assert_eq!(end.timestamp_micros() - start.timestamp_micros(), unit);
         }
+    }
+
+    #[test]
+    fn explicit_replacement_accepts_empty_batches_and_rejects_out_of_window_rows() {
+        let table = crate::test_support::table();
+        let start = DateTime::from_timestamp_micros(0).unwrap();
+        let end = DateTime::from_timestamp_micros(10).unwrap();
+        let bounds = Some((start, end));
+        for values in [vec![], vec![0, 9], vec![4]] {
+            assert_eq!(
+                table
+                    .explicit_or_inferred_bounds(&[replacement_batch(&table, values)], bounds)
+                    .unwrap(),
+                (start, end)
+            );
+        }
+        for values in [vec![-1], vec![10]] {
+            assert!(
+                table
+                    .explicit_or_inferred_bounds(&[replacement_batch(&table, values)], bounds)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("outside")
+            );
+        }
+        assert!(table.explicit_or_inferred_bounds(&[], bounds).is_err());
+        assert!(
+            table
+                .explicit_or_inferred_bounds(
+                    &[replacement_batch(&table, vec![])],
+                    Some((end, start))
+                )
+                .is_err()
+        );
+        let empty = replacement_batch(&table, vec![]);
+        let column = Column {
+            id: 1,
+            ty: "timestamptz".into(),
+        };
+        let (bytes, metadata) = write_parquet(std::slice::from_ref(&empty), &[&column]).unwrap();
+        let info = file_info(
+            "empty.parquet".into(),
+            &bytes,
+            &metadata,
+            &[empty],
+            &[&column],
+        )
+        .unwrap();
+        assert_eq!(info.rows, 0);
+        assert!(info.stats[0].min.is_none());
     }
 
     #[tokio::test]

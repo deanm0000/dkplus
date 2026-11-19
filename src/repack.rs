@@ -2036,9 +2036,7 @@ async fn commit(
     let expire = job
         .expire_snapshot
         .enabled(job.effective_unique().is_some());
-    if expire {
-        expire::lock(&tx).await?;
-    }
+    crate::lock_catalog_write(&tx).await?;
     let snap = tx
         .query_one(
             "SELECT snapshot_id, schema_version, next_catalog_id, next_file_id

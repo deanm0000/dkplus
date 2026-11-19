@@ -65,6 +65,10 @@ and footer size.
 
 ## Catalog configuration and operations
 
+Snapshot publication is serialized with PostgreSQL catalog table locks acquired
+before the first catalog read. All write paths use the same cleanup-compatible
+lock order; file preparation and uploads remain outside this critical section.
+
 ### Set policy tags from the command line
 
 This package builds both the library and the `dkplus` binary (`cargo build --bin
@@ -218,6 +222,13 @@ bound is one microsecond later for timestamps or one day later for dates.
 Gaps between input times are replaced too; this does not round to calendar days.
 Empty inputs, null times, incompatible types, and unrepresentable bounds fail
 before connecting or uploading data.
+
+For sparse reports or complete-day replacements, use
+`table.replace_between(begin, end, batches).await?` with `repack::Bound` bounds.
+This replaces the entire explicit half-open window, not just the input's time
+range. Input times must be inside the window. Empty replacements are supported
+by supplying a zero-row batch with the table's schema; an empty batch list is
+rejected.
 
 Repack accepts calendar dates and resolves aware-timestamp midnights in
 `Table::timezone`; ambiguous/nonexistent midnights fail. Naive/date windows use
