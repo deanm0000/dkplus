@@ -783,7 +783,12 @@ Eligible files have their file metadata/statistics removed and absolute paths
 added to DuckLake's deletion queue, with a new scheduling timestamp. Snapshot
 change records are retained for conflict detection. This targeted operation
 does not collect unrelated obsolete catalog objects or inlined data; use native
-DuckLake expiry for general catalog garbage collection.
+DuckLake expiry for general catalog garbage collection. Alternatively,
+`maintenance::schedule_unreferenced_table_files(cfg, schema, table)` collects
+unreferenced retired data and delete files for one current table without expiring
+any snapshots or deleting objects. It removes their metadata and queues their
+resolved paths atomically with a new scheduling timestamp. It does not scan
+storage for orphaned objects.
 
 No objects are physically deleted during expiry. Run
 `maintenance::cleanup_expired_files` later, with a cutoff old enough for active
@@ -935,12 +940,30 @@ async fn cleanup(cfg: &Config) -> dkplus::Result<()> {
   delete-file metadata, not just the current snapshot. Still-referenced files
   cause an error even if someone incorrectly queued them.
 - Cleanup holds Postgres locks on the queue and relevant metadata throughout
-  deletion. It can block writers; schedule it accordingly. Run exclusively with
-  respect to other cleanup tools or direct object-store writers.
+  deletion. Catalog-wide non-dry-run cleanup commits every 100 queue entries,
+  releasing those locks between batches. It can block writers; schedule it
+  accordingly. Run exclusively with respect to other cleanup tools or direct
+  object-store writers.
 - Objects are deleted before queue entries are removed. Storage/database errors
   are returned with context. A failed call can have deleted some objects while
-  leaving their queue entries intact; retrying safely acknowledges missing files.
+  leaving their batch's queue entries intact; prior committed batches remain
+  acknowledged, and retrying safely acknowledges missing files.
   Cleanup does not create/increment a snapshot or change table statistics.
+
+`maintenance::cleanup_stale_temp_files(cfg, older_than, dry_run)` lists `_tmp/`
+under catalog table roots and deletes files with a last-modified time strictly
+before the cutoff, rechecking their modification time before deletion. It includes
+dropped table roots and deduplicates shared roots. It also deletes old Azure
+hierarchical-namespace directory markers under `_tmp`,
+including the root, using nonrecursive, ETag-conditional deletion; nonempty and
+changed directories are retained and counted separately. Non-Azure stores do
+not receive a directory-marker sweep. Directory age does not establish child
+age, and active jobs are not tracked.
+Azure catalog paths
+using `azure://` are interpreted in the configured Azure account. Paths outside
+that account's supported Azure URI schemes are logged and returned in
+`TempCleanupReport::skipped_tables`. The function does not track active jobs;
+the caller must choose a cutoff consistent with acceptable interruption risk.
 
 ### 4. Standalone Parquet and object stores
 

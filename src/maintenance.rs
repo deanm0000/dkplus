@@ -13,7 +13,8 @@ mod cleanup;
 mod plan;
 mod rules;
 pub use cleanup::{
-    CleanupFile, CleanupOptions, CleanupReport, CleanupScope, cleanup_expired_files,
+    CleanupFile, CleanupOptions, CleanupReport, CleanupScope, TempCleanupReport,
+    cleanup_expired_files, cleanup_stale_temp_files, schedule_unreferenced_table_files,
 };
 pub(crate) use rules::Clock;
 pub use rules::{CalendarUnit, Granularity, Interval, RepackLevel};

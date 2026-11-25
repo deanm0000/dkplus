@@ -2,7 +2,7 @@ use chrono::{Duration, Utc};
 use dkplus::{
     Config, Storage,
     config::{DEFAULT_REPACK_NODE_BYTES, DEFAULT_REPACK_RUN_BYTES},
-    maintenance::{CleanupOptions, CleanupScope, cleanup_expired_files},
+    maintenance::{CleanupOptions, CleanupScope, cleanup_expired_files, cleanup_stale_temp_files},
 };
 use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 use std::sync::Arc;
@@ -295,6 +295,12 @@ async fn expired_file_cleanup_memory_and_local() {
                 .get(0);
             assert_eq!(queued, 1);
             std::fs::remove_dir(error_path).unwrap();
+            client
+                .batch_execute(
+                    "DELETE FROM ducklake.ducklake_files_scheduled_for_deletion WHERE data_file_id = 100",
+                )
+                .await
+                .unwrap();
         }
         options.scope = CleanupScope::Table {
             schema: "weather".into(),
@@ -306,6 +312,101 @@ async fn expired_file_cleanup_memory_and_local() {
             table: "a".into(),
         };
         assert!(cleanup_expired_files(&cfg, &options).await.is_err());
+
+        options.scope = CleanupScope::Catalog;
+        for id in 101_i64..=201 {
+            let key = format!("weather/a/batch-{id}.parquet");
+            store
+                .put(&Path::from(key.clone()), "parquet".into())
+                .await
+                .unwrap();
+            client.execute(
+                "INSERT INTO ducklake.ducklake_files_scheduled_for_deletion VALUES ($1,$2,true,$3)",
+                &[&id, &key, &old],
+            ).await.unwrap();
+        }
+        client.batch_execute(
+            "CREATE FUNCTION ducklake.fail_last_ack() RETURNS trigger LANGUAGE plpgsql AS
+             $$ BEGIN IF OLD.data_file_id = 201 THEN RAISE EXCEPTION 'injected'; END IF; RETURN OLD; END $$;
+             CREATE TRIGGER fail_last_ack BEFORE DELETE ON ducklake.ducklake_files_scheduled_for_deletion
+             FOR EACH ROW EXECUTE FUNCTION ducklake.fail_last_ack();"
+        ).await.unwrap();
+        assert!(cleanup_expired_files(&cfg, &options).await.is_err());
+        let remaining: i64 = client.query_one(
+            "SELECT count(*) FROM ducklake.ducklake_files_scheduled_for_deletion WHERE data_file_id BETWEEN 101 AND 201",
+            &[],
+        ).await.unwrap().get(0);
+        assert_eq!(remaining, 1);
+        client
+            .batch_execute(
+                "DROP TRIGGER fail_last_ack ON ducklake.ducklake_files_scheduled_for_deletion;
+             DROP FUNCTION ducklake.fail_last_ack();",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cleanup_expired_files(&cfg, &options)
+                .await
+                .unwrap()
+                .files
+                .len(),
+            1
+        );
+        for key in [
+            "weather/a/_tmp/repack-one/old.parquet",
+            "weather/ab/_tmp/repack-two/old.parquet",
+            "weather/a/_tmpish/keep.parquet",
+        ] {
+            store.put(&Path::from(key), "parquet".into()).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let cutoff = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        store
+            .put(
+                &Path::from("weather/a/_tmp/repack-one/new.parquet"),
+                "parquet".into(),
+            )
+            .await
+            .unwrap();
+        let fresh = store
+            .head(&Path::from("weather/a/_tmp/repack-one/new.parquet"))
+            .await
+            .unwrap();
+        assert!(
+            fresh.last_modified >= cutoff,
+            "new file modified {} before cutoff {cutoff}",
+            fresh.last_modified
+        );
+        let preview = cleanup_stale_temp_files(&cfg, cutoff, true).await.unwrap();
+        assert_eq!(preview.candidates, 2);
+        assert_eq!(preview.deleted, 0);
+        let result = cleanup_stale_temp_files(&cfg, cutoff, false).await.unwrap();
+        assert_eq!(result.deleted, 2);
+        assert!(result.skipped_tables.is_empty());
+        for key in [
+            "weather/a/_tmp/repack-one/new.parquet",
+            "weather/a/_tmpish/keep.parquet",
+        ] {
+            assert!(store.head(&Path::from(key)).await.is_ok());
+        }
+        assert!(
+            store
+                .head(&Path::from("weather/a/_tmp/repack-one/old.parquet"))
+                .await
+                .is_err()
+        );
+        let azure_cfg = Config {
+            storage: Storage::Azure {
+                account: "testaccount".into(),
+                access_key: "dGVzdA==".into(),
+            },
+            ..cfg.clone()
+        };
+        let skipped = cleanup_stale_temp_files(&azure_cfg, cutoff, true)
+            .await
+            .unwrap();
+        assert_eq!(skipped.skipped_tables.len(), 3);
         client
             .batch_execute("DROP SCHEMA ducklake CASCADE")
             .await

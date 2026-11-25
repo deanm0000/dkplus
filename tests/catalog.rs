@@ -145,6 +145,154 @@ async fn count(client: &tokio_postgres::Client, sql: &str) -> i64 {
 
 #[tokio::test]
 #[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+async fn schedules_only_unreferenced_retired_table_files() {
+    use dkplus::maintenance::schedule_unreferenced_table_files;
+
+    let postgres: tokio_postgres::Config = std::env::var("DKPLUS_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (client, connection) = postgres.connect(tokio_postgres::NoTls).await.unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    client.batch_execute(CATALOG).await.unwrap();
+    client.batch_execute(
+        "INSERT INTO ducklake.ducklake_metadata VALUES ('data_path','memory:///',NULL);
+         INSERT INTO ducklake.ducklake_table VALUES
+             (1,1,'observations','observations/',true,NULL),
+             (2,1,'other','other/',true,NULL);
+         INSERT INTO ducklake.ducklake_snapshot VALUES (4,now(),0,1,1),(8,now(),0,1,1);
+         INSERT INTO ducklake.ducklake_data_file
+             (data_file_id,table_id,begin_snapshot,end_snapshot,path,path_is_relative) VALUES
+             (1,1,1,4,'obsolete.parquet',true),
+             (2,1,4,8,'retained.parquet',true),
+             (3,1,8,NULL,'current.parquet',true),
+             (4,2,1,4,'other.parquet',true),
+             (5,1,NULL,4,'unknown-begin.parquet',true);
+         INSERT INTO ducklake.ducklake_delete_file
+             (delete_file_id,table_id,data_file_id,begin_snapshot,end_snapshot,path,path_is_relative) VALUES
+             (11,1,1,1,NULL,'attached.parquet',true),
+             (12,1,2,1,4,'old-delete.parquet',true),
+             (13,1,2,4,8,'retained-delete.parquet',true);
+         INSERT INTO ducklake.ducklake_file_column_stats (data_file_id,table_id) VALUES (1,1),(2,1);
+         INSERT INTO ducklake.ducklake_file_partition_value (data_file_id,table_id) VALUES (1,1),(2,1);
+         INSERT INTO ducklake.ducklake_file_variant_stats (data_file_id,table_id) VALUES (1,1),(2,1);"
+    ).await.unwrap();
+    let cfg = Config {
+        postgres,
+        storage: Storage::Store {
+            root: "memory:///".into(),
+            store: Arc::new(InMemory::new()),
+        },
+        log: Arc::new(|_| {}),
+        repack_run_bytes: 1,
+        repack_node_bytes: 1,
+    };
+    client.batch_execute(
+        "CREATE FUNCTION ducklake.fail_schedule() RETURNS trigger LANGUAGE plpgsql AS
+         $$ BEGIN RAISE EXCEPTION 'injected'; END $$;
+         CREATE TRIGGER fail_schedule BEFORE INSERT ON ducklake.ducklake_files_scheduled_for_deletion
+         FOR EACH ROW EXECUTE FUNCTION ducklake.fail_schedule();"
+    ).await.unwrap();
+    assert!(
+        schedule_unreferenced_table_files(&cfg, "weather", "observations")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM ducklake.ducklake_data_file").await,
+        5
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.ducklake_delete_file"
+        )
+        .await,
+        3
+    );
+    client
+        .batch_execute(
+            "DROP TRIGGER fail_schedule ON ducklake.ducklake_files_scheduled_for_deletion;
+         DROP FUNCTION ducklake.fail_schedule();",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        schedule_unreferenced_table_files(&cfg, "weather", "observations")
+            .await
+            .unwrap(),
+        3
+    );
+    let rows = client.query(
+        "SELECT data_file_id, path, path_is_relative FROM ducklake.ducklake_files_scheduled_for_deletion ORDER BY data_file_id",
+        &[],
+    ).await.unwrap();
+    let actual: Vec<(i64, String, bool)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (
+                1,
+                "memory:///weather/observations/obsolete.parquet".into(),
+                false
+            ),
+            (
+                11,
+                "memory:///weather/observations/attached.parquet".into(),
+                false
+            ),
+            (
+                12,
+                "memory:///weather/observations/old-delete.parquet".into(),
+                false
+            ),
+        ]
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM ducklake.ducklake_data_file").await,
+        4
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ducklake.ducklake_delete_file"
+        )
+        .await,
+        1
+    );
+    for stats in [
+        "ducklake_file_column_stats",
+        "ducklake_file_partition_value",
+        "ducklake_file_variant_stats",
+    ] {
+        assert_eq!(
+            count(&client, &format!("SELECT count(*) FROM ducklake.{stats}")).await,
+            1
+        );
+    }
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM ducklake.ducklake_snapshot").await,
+        3
+    );
+    assert_eq!(
+        schedule_unreferenced_table_files(&cfg, "weather", "observations")
+            .await
+            .unwrap(),
+        0
+    );
+    client
+        .batch_execute("DROP SCHEMA ducklake CASCADE")
+        .await
+        .unwrap();
+    drop(client);
+    connection.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires DKPLUS_TEST_DATABASE_URL pointing to an isolated Postgres database"]
 async fn typed_errors_preserve_catalog_sources_and_retry_exhaustion() {
     use dkplus::Error;
     use tokio_postgres::error::SqlState;
